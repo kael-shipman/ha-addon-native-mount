@@ -1,0 +1,41 @@
+name: Native Mount
+description: >-
+  Mounts one or more configured block devices into the host filesystem using
+  nsenter, then optionally runs post-mount shell commands (e.g. to start
+  another add-on). Runs at the initialize stage so drives are ready before
+  application-stage add-ons (like Frigate) start.
+version: "0.1.0"
+slug: native_mount
+url: https://github.com/TODO/ha-addon-native-mount
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+
+# Start before application-stage add-ons (e.g. Frigate) so drives are mounted first.
+startup: initialize
+boot: auto
+
+# Needed to enter the host's mount namespace via nsenter and perform mounts.
+host_pid: true
+privileged:
+  - SYS_ADMIN
+
+# Needed to run `ha addons start/stop` in post_mount_ha_commands.
+hassio_api: true
+hassio_role: manager
+
+options:
+  mounts: []
+  post_mount_ha_commands: []
+
+schema:
+  mounts:
+    - device_uuid: str
+      mount_point: str
+      fstype: str?
+      wait_timeout: int?
+  post_mount_ha_commands:
+    - str?
