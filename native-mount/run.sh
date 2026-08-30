@@ -5,9 +5,9 @@ set -euo pipefail
 # host_pid=true. This gives us:
 #   /proc/1/ns/mnt  — the host's mount namespace (for nsenter)
 
-log_info()    { echo "[INFO]    native-mount: $*"; }
-log_warning() { echo "[WARNING] native-mount: $*"; }
-log_error()   { echo "[ERROR]   native-mount: $*" >&2; }
+log_info()    { echo "[$(date '+%H:%M:%S')] [INFO]    native-mount: $*"; }
+log_warning() { echo "[$(date '+%H:%M:%S')] [WARNING] native-mount: $*"; }
+log_error()   { echo "[$(date '+%H:%M:%S')] [ERROR]   native-mount: $*" >&2; }
 
 # Thin wrapper so users can write `ha addons start <slug>` in commands.
 # Calls the Supervisor REST API; requires hassio_api: true + hassio_role: manager.
@@ -65,14 +65,28 @@ for i in $(seq 0 $((mount_count - 1))); do
         log_info "[${i}] Attempting to mount UUID=${uuid} -> ${mount_point} as ${fstype} (Waiting up to ${wait_timeout}s for device to appear)"
     fi
 
-    # Check device existence via nsenter (host mount namespace has the real /dev).
-    # Using nsenter here also validates that nsenter + SYS_PTRACE work before we
-    # commit to the actual mount.
+    # Verify nsenter can open the host's mount namespace before polling.
+    # Requires SYS_PTRACE to open /proc/1/ns/mnt. A failure here means a
+    # capability or seccomp issue, not a missing device.
+    nsenter_check=$(nsenter --mount=/proc/1/ns/mnt -- echo "ok" 2>&1) || true
+    if [ "${nsenter_check}" != "ok" ]; then
+        log_error "[${i}] nsenter cannot open host mount namespace: ${nsenter_check}"
+        log_error "[${i}] Ensure SYS_PTRACE is listed in the add-on's privileged config"
+        run_commands "[${i}] on_failure" ".mounts[${i}].on_failure"
+        continue
+    fi
+
+    # Poll using blkid -U (reads device headers directly; does not depend on
+    # udev having created /dev/disk/by-uuid/ symlinks).
     elapsed=0
     device_found=true
-    until nsenter --mount=/proc/1/ns/mnt -- test -e "/dev/disk/by-uuid/${uuid}" 2>/dev/null; do
+    until nsenter --mount=/proc/1/ns/mnt -- blkid -U "${uuid}" >/dev/null 2>&1; do
         if [ "${elapsed}" -ge "${wait_timeout}" ]; then
             log_error "[${i}] device UUID=${uuid} not found after ${wait_timeout}s — skipping"
+            log_info "[${i}] Block devices visible in host namespace:"
+            nsenter --mount=/proc/1/ns/mnt -- blkid 2>&1 | while IFS= read -r line; do
+                log_info "[${i}]   ${line}"
+            done
             device_found=false
             break
         fi
