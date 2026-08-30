@@ -4,7 +4,7 @@ description: >-
   nsenter, then optionally runs post-mount shell commands (e.g. to start
   another add-on). Runs at the initialize stage so drives are ready before
   application-stage add-ons (like Frigate) start.
-version: "0.3.0"
+version: "0.4.0"
 slug: native_mount
 url: https://github.com/kael-shipman/ha-addon-native-mount
 arch:
@@ -17,11 +17,11 @@ arch:
 startup: initialize
 boot: auto
 
-# SYS_ADMIN: perform mounts; SYS_PTRACE: open /proc/1/ns/mnt for nsenter
+# full_access maps to Docker --privileged, which disables AppArmor/seccomp
+# profiles that otherwise block nsenter from opening /proc/1/ns/mnt even when
+# SYS_PTRACE and SYS_ADMIN are granted individually.
 host_pid: true
-privileged:
-  - SYS_ADMIN
-  - SYS_PTRACE
+full_access: true
 
 # Needed to call `ha addons start/stop` via the Supervisor API
 hassio_api: true
