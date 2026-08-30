@@ -1,10 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# /proc/1 refers to the HOST's systemd (not the container init) because
-# host_pid=true. This gives us:
-#   /proc/1/ns/mnt  — the host's mount namespace (for nsenter)
-
 log_info()    { echo "[$(date '+%H:%M:%S')] [INFO]    native-mount: $*"; }
 log_warning() { echo "[$(date '+%H:%M:%S')] [WARNING] native-mount: $*"; }
 log_error()   { echo "[$(date '+%H:%M:%S')] [ERROR]   native-mount: $*" >&2; }
@@ -46,6 +42,21 @@ run_commands() {
     done
 }
 
+# Translate HA host-side paths to container-accessible paths.
+# The HA Supervisor bind-mounts these with shared propagation, so mounts
+# made here propagate to the host and other add-on containers.
+#   /mnt/data/supervisor/media/ → /media/
+#   /mnt/data/supervisor/share/ → /share/
+# Paths that are already container paths, or unknown paths, pass through unchanged.
+to_container_path() {
+    local p="$1"
+    case "${p}" in
+        /mnt/data/supervisor/media/*)  printf '/media/%s'  "${p#/mnt/data/supervisor/media/}"  ;;
+        /mnt/data/supervisor/share/*)  printf '/share/%s'  "${p#/mnt/data/supervisor/share/}"  ;;
+        *)                             printf '%s'          "${p}"                               ;;
+    esac
+}
+
 CONFIG="/data/options.json"
 
 log_info "starting"
@@ -59,34 +70,25 @@ for i in $(seq 0 $((mount_count - 1))); do
     fstype=$(jq -r ".mounts[${i}].fstype // \"auto\"" "${CONFIG}")
     wait_timeout=$(jq -r ".mounts[${i}].wait_timeout // 30" "${CONFIG}")
 
+    container_mount_point=$(to_container_path "${mount_point}")
+
     if [ "${fstype}" = "auto" ]; then
         log_info "[${i}] Attempting to mount UUID=${uuid} -> ${mount_point} (Waiting up to ${wait_timeout}s for device to appear)"
     else
         log_info "[${i}] Attempting to mount UUID=${uuid} -> ${mount_point} as ${fstype} (Waiting up to ${wait_timeout}s for device to appear)"
     fi
+    [ "${container_mount_point}" != "${mount_point}" ] && \
+        log_info "[${i}] Container path: ${container_mount_point}"
 
-    # Verify nsenter can open the host's mount namespace before polling.
-    # Requires SYS_PTRACE to open /proc/1/ns/mnt. A failure here means a
-    # capability or seccomp issue, not a missing device.
-    nsenter_check=$(nsenter --mount=/proc/1/ns/mnt -- echo "ok" 2>&1) || true
-    if [ "${nsenter_check}" != "ok" ]; then
-        log_error "[${i}] nsenter cannot open host mount namespace: ${nsenter_check}"
-        log_error "[${i}] Ensure SYS_PTRACE is listed in the add-on's privileged config"
-        run_commands "[${i}] on_failure" ".mounts[${i}].on_failure"
-        continue
-    fi
-
-    # Poll using blkid -U (reads device headers directly; does not depend on
-    # udev having created /dev/disk/by-uuid/ symlinks).
+    # Poll for the device. full_access exposes all host block devices at /dev/
+    # so we can check by-uuid symlinks directly without nsenter.
     elapsed=0
     device_found=true
-    until nsenter --mount=/proc/1/ns/mnt -- blkid -U "${uuid}" >/dev/null 2>&1; do
+    until [ -e "/dev/disk/by-uuid/${uuid}" ]; do
         if [ "${elapsed}" -ge "${wait_timeout}" ]; then
             log_error "[${i}] device UUID=${uuid} not found after ${wait_timeout}s — skipping"
-            log_info "[${i}] Block devices visible in host namespace:"
-            nsenter --mount=/proc/1/ns/mnt -- blkid 2>&1 | while IFS= read -r line; do
-                log_info "[${i}]   ${line}"
-            done
+            log_info "[${i}] Visible block devices:"
+            blkid 2>&1 | while IFS= read -r line; do log_info "[${i}]   ${line}"; done
             device_found=false
             break
         fi
@@ -102,11 +104,9 @@ for i in $(seq 0 $((mount_count - 1))); do
     log_info "[${i}] device found after ${elapsed}s"
 
     if [ "${fstype}" = "auto" ]; then
-        mount_out=$(nsenter --mount=/proc/1/ns/mnt -- \
-            mount "UUID=${uuid}" "${mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
+        mount_out=$(mount "UUID=${uuid}" "${container_mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
     else
-        mount_out=$(nsenter --mount=/proc/1/ns/mnt -- \
-            mount -t "${fstype}" "UUID=${uuid}" "${mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
+        mount_out=$(mount -t "${fstype}" "UUID=${uuid}" "${container_mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
     fi
 
     if [ "${mount_exit}" -eq 0 ]; then

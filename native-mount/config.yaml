@@ -1,10 +1,10 @@
 name: Native Mount
 description: >-
-  Mounts one or more configured block devices into the host filesystem using
-  nsenter, then optionally runs post-mount shell commands (e.g. to start
-  another add-on). Runs at the initialize stage so drives are ready before
-  application-stage add-ons (like Frigate) start.
-version: "0.4.0"
+  Mounts one or more configured block devices into the HA media directory,
+  then optionally runs post-mount shell commands (e.g. to start another add-on).
+  Runs at the initialize stage so drives are ready before application-stage
+  add-ons (like Frigate) start.
+version: "0.5.0"
 slug: native_mount
 url: https://github.com/kael-shipman/ha-addon-native-mount
 arch:
@@ -17,11 +17,15 @@ arch:
 startup: initialize
 boot: auto
 
-# full_access maps to Docker --privileged, which disables AppArmor/seccomp
-# profiles that otherwise block nsenter from opening /proc/1/ns/mnt even when
-# SYS_PTRACE and SYS_ADMIN are granted individually.
-host_pid: true
+# full_access exposes all host block devices inside the container (/dev/disk/by-uuid/...).
+# SYS_ADMIN is required to perform mount operations.
 full_access: true
+
+# /media and /share are bind-mounted with shared propagation by the HA Supervisor,
+# so mounts done here propagate to the host and to other add-on containers.
+map:
+  - media:rw
+  - share:rw
 
 # Needed to call `ha addons start/stop` via the Supervisor API
 hassio_api: true
