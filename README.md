@@ -18,13 +18,13 @@ SSH session.
 
 Click the button below to add this repository to your Home Assistant instance:
 
-[![Add repository to Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FTODO%2Fha-addon-native-mount)
+[![Add repository to Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fkael-shipman%2Fha-addon-native-mount)
 
 Or manually: **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, then
 add:
 
 ```
-https://github.com/TODO/ha-addon-native-mount
+https://github.com/kael-shipman/ha-addon-native-mount
 ```
 
 Once the repository is added, find **Native Mount** in the store and install it.
