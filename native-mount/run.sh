@@ -4,11 +4,47 @@ set -euo pipefail
 # /proc/1 refers to the HOST's systemd (not the container init) because
 # host_pid=true. This gives us:
 #   /proc/1/ns/mnt  — the host's mount namespace (for nsenter)
-#   /proc/1/root/   — the host's root fs view (for device detection)
 
 log_info()    { echo "[INFO]    native-mount: $*"; }
 log_warning() { echo "[WARNING] native-mount: $*"; }
 log_error()   { echo "[ERROR]   native-mount: $*" >&2; }
+
+# Thin wrapper so users can write `ha addons start <slug>` in commands.
+# Calls the Supervisor REST API; requires hassio_api: true + hassio_role: manager.
+ha() {
+    local cmd="${1:-}" sub="${2:-}" slug="${3:-}"
+    if [ "${cmd}" != "addons" ]; then
+        log_error "ha wrapper: only 'addons' commands are supported (got: $*)"
+        return 1
+    fi
+    case "${sub}" in
+        start|stop|restart)
+            curl -sf -X POST \
+                -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+                "http://supervisor/addons/${slug}/${sub}" >/dev/null
+            ;;
+        *)
+            log_error "ha wrapper: unsupported subcommand '${sub}'"
+            return 1
+            ;;
+    esac
+}
+
+run_commands() {
+    local label="$1" config_path="$2"
+    local count
+    count=$(jq "if ${config_path} then ${config_path} | length else 0 end" "${CONFIG}")
+    [ "${count}" -eq 0 ] && return 0
+    log_info "${label}: running ${count} command(s)"
+    for i in $(seq 0 $((count - 1))); do
+        local cmd
+        cmd=$(jq -r "${config_path}[${i}]" "${CONFIG}")
+        log_info "${label}: $ ${cmd}"
+        if ! eval "${cmd}"; then
+            log_warning "${label}: command exited non-zero: ${cmd}"
+        fi
+    done
+}
 
 CONFIG="/data/options.json"
 
@@ -23,12 +59,18 @@ for i in $(seq 0 $((mount_count - 1))); do
     fstype=$(jq -r ".mounts[${i}].fstype // \"auto\"" "${CONFIG}")
     wait_timeout=$(jq -r ".mounts[${i}].wait_timeout // 30" "${CONFIG}")
 
-    log_info "[${i}] UUID=${uuid} -> ${mount_point} (fstype=${fstype}, timeout=${wait_timeout}s)"
+    if [ "${fstype}" = "auto" ]; then
+        log_info "[${i}] Attempting to mount UUID=${uuid} -> ${mount_point} (Waiting up to ${wait_timeout}s for device to appear)"
+    else
+        log_info "[${i}] Attempting to mount UUID=${uuid} -> ${mount_point} as ${fstype} (Waiting up to ${wait_timeout}s for device to appear)"
+    fi
 
-    device="/proc/1/root/dev/disk/by-uuid/${uuid}"
+    # Check device existence via nsenter (host mount namespace has the real /dev).
+    # Using nsenter here also validates that nsenter + SYS_PTRACE work before we
+    # commit to the actual mount.
     elapsed=0
     device_found=true
-    until [ -e "${device}" ]; do
+    until nsenter --mount=/proc/1/ns/mnt -- test -e "/dev/disk/by-uuid/${uuid}" 2>/dev/null; do
         if [ "${elapsed}" -ge "${wait_timeout}" ]; then
             log_error "[${i}] device UUID=${uuid} not found after ${wait_timeout}s — skipping"
             device_found=false
@@ -37,7 +79,11 @@ for i in $(seq 0 $((mount_count - 1))); do
         sleep 1
         elapsed=$((elapsed + 1))
     done
-    [ "${device_found}" = "false" ] && continue
+
+    if [ "${device_found}" = "false" ]; then
+        run_commands "[${i}] on_failure" ".mounts[${i}].on_failure"
+        continue
+    fi
 
     log_info "[${i}] device found after ${elapsed}s"
 
@@ -51,21 +97,13 @@ for i in $(seq 0 $((mount_count - 1))); do
 
     if [ "${mount_exit}" -eq 0 ]; then
         log_info "[${i}] mounted successfully"
+        run_commands "[${i}] on_success" ".mounts[${i}].on_success"
     else
         log_error "[${i}] mount failed (exit ${mount_exit}): ${mount_out}"
+        run_commands "[${i}] on_failure" ".mounts[${i}].on_failure"
     fi
 done
 
-cmd_count=$(jq 'if .post_mount_ha_commands then .post_mount_ha_commands | length else 0 end' "${CONFIG}")
-if [ "${cmd_count}" -gt 0 ]; then
-    log_info "running ${cmd_count} post-mount command(s)"
-    for i in $(seq 0 $((cmd_count - 1))); do
-        cmd=$(jq -r ".post_mount_ha_commands[${i}]" "${CONFIG}")
-        log_info "$ ${cmd}"
-        if ! eval "${cmd}"; then
-            log_warning "command exited non-zero: ${cmd}"
-        fi
-    done
-fi
+run_commands "post_mount" ".post_mount_ha_commands"
 
 log_info "done"

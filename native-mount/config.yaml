@@ -4,7 +4,7 @@ description: >-
   nsenter, then optionally runs post-mount shell commands (e.g. to start
   another add-on). Runs at the initialize stage so drives are ready before
   application-stage add-ons (like Frigate) start.
-version: "0.1.0"
+version: "0.2.0"
 slug: native_mount
 url: https://github.com/kael-shipman/ha-addon-native-mount
 arch:
@@ -14,16 +14,16 @@ arch:
   - armv7
   - i386
 
-# Start before application-stage add-ons (e.g. Frigate) so drives are mounted first.
 startup: initialize
 boot: auto
 
-# Needed to enter the host's mount namespace via nsenter and perform mounts.
+# SYS_ADMIN: perform mounts; SYS_PTRACE: open /proc/1/ns/mnt for nsenter
 host_pid: true
 privileged:
   - SYS_ADMIN
+  - SYS_PTRACE
 
-# Needed to run `ha addons start/stop` in post_mount_ha_commands.
+# Needed to call `ha addons start/stop` via the Supervisor API
 hassio_api: true
 hassio_role: manager
 
@@ -37,5 +37,9 @@ schema:
       mount_point: str
       fstype: str?
       wait_timeout: int?
+      on_success:
+        - str?
+      on_failure:
+        - str?
   post_mount_ha_commands:
     - str?
