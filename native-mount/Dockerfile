@@ -1,8 +1,9 @@
-ARG BUILD_FROM
-FROM $BUILD_FROM
+FROM alpine:3.21
 
-# util-linux provides nsenter
-RUN apk add --no-cache util-linux
+# bash: run.sh runtime
+# jq: config parsing
+# util-linux: nsenter
+RUN apk add --no-cache bash jq util-linux
 
 COPY run.sh /
 RUN chmod a+x /run.sh

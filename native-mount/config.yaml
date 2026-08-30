@@ -6,7 +6,7 @@ description: >-
   application-stage add-ons (like Frigate) start.
 version: "0.1.0"
 slug: native_mount
-url: https://github.com/TODO/ha-addon-native-mount
+url: https://github.com/kael-shipman/ha-addon-native-mount
 arch:
   - aarch64
   - amd64
