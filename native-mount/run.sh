@@ -77,6 +77,14 @@ for i in $(seq 0 $((mount_count - 1))); do
 
     log_info "[${i}] device found after ${elapsed}s ($(blkid -U "${uuid}"))"
 
+    # Skip if already mounted at this mount point (handles add-on running multiple
+    # times during boot, or a manual restart without reboot).
+    if nsenter --mount=/proc/1/ns/mnt -- findmnt -n "${mount_point}" >/dev/null 2>&1; then
+        log_info "[${i}] ${mount_point} is already mounted — skipping"
+        run_commands "[${i}] on_success" ".mounts[${i}].on_success"
+        continue
+    fi
+
     # Mount in the host's mount namespace so the result is visible to all host
     # processes and add-on containers (including Frigate).
     # Requires: host_pid: true, apparmor: false, privileged: [SYS_ADMIN, SYS_PTRACE]
