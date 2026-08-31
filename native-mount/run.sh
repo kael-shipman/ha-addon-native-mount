@@ -61,12 +61,23 @@ log_info "[diag] CAP_SYS_ADMIN (bit 21): ${has_sys_admin}"
 log_info "[diag] CAP_SYS_PTRACE (bit 19): ${has_sys_ptrace}"
 
 # --- host_pid check ---
-log_info "[diag] /proc/1/exe -> $(readlink /proc/1/exe 2>&1)"
+proc1_exe=$(readlink /proc/1/exe 2>&1 || echo "(readlink failed)")
+proc1_cmd=$(cat /proc/1/cmdline 2>/dev/null | tr '\0' ' ' || echo "(no cmdline)")
+proc1_mnt=$(readlink /proc/1/ns/mnt 2>&1 || echo "(readlink ns/mnt failed)")
+proc_self_mnt=$(readlink /proc/self/ns/mnt 2>&1 || echo "(readlink self ns/mnt failed)")
+log_info "[diag] /proc/1/exe: ${proc1_exe}"
+log_info "[diag] /proc/1/cmdline: ${proc1_cmd}"
+log_info "[diag] /proc/1/ns/mnt: ${proc1_mnt}"
+log_info "[diag] /proc/self/ns/mnt: ${proc_self_mnt}"
+if [ "${proc1_mnt}" = "${proc_self_mnt}" ]; then
+    log_info "[diag] WARNING: /proc/1 and /proc/self are in the SAME mount namespace (host_pid may not be working)"
+else
+    log_info "[diag] /proc/1 is in a DIFFERENT namespace — host_pid is working"
+fi
 
 # --- nsenter check ---
-log_info "[diag] Testing nsenter..."
-nsenter_out=$(nsenter --mount=/proc/1/ns/mnt -- echo "nsenter_ok" 2>&1)
-nsenter_exit=$?
+log_info "[diag] Testing nsenter (timeout 5s)..."
+nsenter_out=$(timeout 5 nsenter --mount=/proc/1/ns/mnt -- echo "nsenter_ok" 2>&1) && nsenter_exit=0 || nsenter_exit=$?
 log_info "[diag] nsenter exit=${nsenter_exit} out=${nsenter_out}"
 
 # --- blkid device check ---
