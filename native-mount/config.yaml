@@ -4,7 +4,7 @@ description: >-
   then optionally runs post-mount shell commands (e.g. to start another add-on).
   Runs at the initialize stage so drives are ready before application-stage
   add-ons (like Frigate) start.
-version: "0.7.0"
+version: "0.8.0"
 slug: native_mount
 url: https://github.com/kael-shipman/ha-addon-native-mount
 arch:
@@ -20,8 +20,10 @@ boot: auto
 # host_pid: /proc/1 refers to the host's PID 1, giving access to /proc/1/ns/mnt for nsenter.
 # SYS_ADMIN: perform mount operations. SYS_PTRACE: open /proc/1/ns/mnt for nsenter.
 # full_access: exposes host block devices + disables seccomp (needed for blkid + mount).
+# apparmor: false disables the default AppArmor profile so nsenter can open /proc/1/ns/mnt.
 host_pid: true
 full_access: true
+apparmor: false
 privileged:
   - SYS_ADMIN
   - SYS_PTRACE
