@@ -1,10 +1,10 @@
 name: Native Mount
 description: >-
-  Mounts one or more configured block devices into the HA media directory,
-  then optionally runs post-mount shell commands (e.g. to start another add-on).
-  Runs at the initialize stage so drives are ready before application-stage
-  add-ons (like Frigate) start.
-version: "0.10.0"
+  Mounts external drives (USB, NVMe, etc.) into the host filesystem at boot,
+  before application-stage add-ons start. Useful for pointing Frigate NVR
+  recordings at an external drive. Uses nsenter to mount in the host namespace
+  so the drive is visible to all add-ons.
+version: "1.0.0"
 slug: native_mount
 url: https://github.com/kael-shipman/ha-addon-native-mount
 arch:
