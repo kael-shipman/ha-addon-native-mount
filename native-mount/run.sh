@@ -6,12 +6,10 @@ log_warning() { echo "[$(date '+%H:%M:%S')] [WARNING] native-mount: $*"; }
 log_error()   { echo "[$(date '+%H:%M:%S')] [ERROR]   native-mount: $*" >&2; }
 
 # Thin wrapper so users can write `ha addons start <slug>` in commands.
-# Calls the Supervisor REST API; requires hassio_api: true + hassio_role: manager.
 ha() {
     local cmd="${1:-}" sub="${2:-}" slug="${3:-}"
     if [ "${cmd}" != "addons" ]; then
-        log_error "ha wrapper: only 'addons' commands are supported (got: $*)"
-        return 1
+        log_error "ha wrapper: only 'addons' commands are supported (got: $*)"; return 1
     fi
     case "${sub}" in
         start|stop|restart)
@@ -19,10 +17,7 @@ ha() {
                 -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
                 "http://supervisor/addons/${slug}/${sub}" >/dev/null
             ;;
-        *)
-            log_error "ha wrapper: unsupported subcommand '${sub}'"
-            return 1
-            ;;
+        *) log_error "ha wrapper: unsupported subcommand '${sub}'"; return 1 ;;
     esac
 }
 
@@ -36,18 +31,10 @@ run_commands() {
         local cmd
         cmd=$(jq -r "${config_path}[${i}]" "${CONFIG}")
         log_info "${label}: $ ${cmd}"
-        if ! eval "${cmd}"; then
-            log_warning "${label}: command exited non-zero: ${cmd}"
-        fi
+        if ! eval "${cmd}"; then log_warning "${label}: command exited non-zero: ${cmd}"; fi
     done
 }
 
-# Translate HA host-side paths to container-accessible paths.
-# The HA Supervisor bind-mounts these with shared propagation, so mounts
-# made here propagate to the host and other add-on containers.
-#   /mnt/data/supervisor/media/ → /media/
-#   /mnt/data/supervisor/share/ → /share/
-# Paths that are already container paths, or unknown paths, pass through unchanged.
 to_container_path() {
     local p="$1"
     case "${p}" in
@@ -59,6 +46,35 @@ to_container_path() {
 
 CONFIG="/data/options.json"
 
+log_info "=== DIAGNOSTIC v0.6.0 ==="
+
+# --- Capability check ---
+log_info "[diag] Effective capabilities (CapEff from /proc/self/status):"
+grep CapEff /proc/self/status | while IFS= read -r line; do log_info "[diag]   ${line}"; done
+
+# Decode key bits (SYS_ADMIN=21, SYS_PTRACE=19)
+capeff=$(grep CapEff /proc/self/status | awk '{print $2}')
+capeff_dec=$((16#${capeff}))
+has_sys_admin=$(( (capeff_dec >> 21) & 1 ))
+has_sys_ptrace=$(( (capeff_dec >> 19) & 1 ))
+log_info "[diag] CAP_SYS_ADMIN (bit 21): ${has_sys_admin}"
+log_info "[diag] CAP_SYS_PTRACE (bit 19): ${has_sys_ptrace}"
+
+# --- host_pid check ---
+log_info "[diag] /proc/1/exe -> $(readlink /proc/1/exe 2>&1)"
+
+# --- nsenter check ---
+log_info "[diag] Testing nsenter..."
+nsenter_out=$(nsenter --mount=/proc/1/ns/mnt -- echo "nsenter_ok" 2>&1)
+nsenter_exit=$?
+log_info "[diag] nsenter exit=${nsenter_exit} out=${nsenter_out}"
+
+# --- blkid device check ---
+log_info "[diag] All block devices (blkid):"
+blkid 2>&1 | while IFS= read -r line; do log_info "[diag]   ${line}"; done
+
+log_info "=== END DIAGNOSTIC ==="
+log_info ""
 log_info "starting"
 
 mount_count=$(jq 'if .mounts then .mounts | length else 0 end' "${CONFIG}")
@@ -80,11 +96,10 @@ for i in $(seq 0 $((mount_count - 1))); do
     [ "${container_mount_point}" != "${mount_point}" ] && \
         log_info "[${i}] Container path: ${container_mount_point}"
 
-    # Poll for the device. full_access exposes all host block devices at /dev/
-    # so we can check by-uuid symlinks directly without nsenter.
+    # Poll for device using blkid (doesn't depend on udev by-uuid symlinks).
     elapsed=0
     device_found=true
-    until [ -e "/dev/disk/by-uuid/${uuid}" ]; do
+    until blkid -U "${uuid}" >/dev/null 2>&1; do
         if [ "${elapsed}" -ge "${wait_timeout}" ]; then
             log_error "[${i}] device UUID=${uuid} not found after ${wait_timeout}s — skipping"
             log_info "[${i}] Visible block devices:"
@@ -101,12 +116,26 @@ for i in $(seq 0 $((mount_count - 1))); do
         continue
     fi
 
-    log_info "[${i}] device found after ${elapsed}s"
+    log_info "[${i}] device found after ${elapsed}s ($(blkid -U "${uuid}"))"
 
-    if [ "${fstype}" = "auto" ]; then
-        mount_out=$(mount "UUID=${uuid}" "${container_mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
+    # Try mount via nsenter first (preserves host namespace visibility).
+    # Fall back to direct container mount (propagates if /media or /share bind is rshared).
+    if nsenter --mount=/proc/1/ns/mnt -- echo "ok" >/dev/null 2>&1; then
+        log_info "[${i}] Mounting via nsenter (host namespace)"
+        if [ "${fstype}" = "auto" ]; then
+            mount_out=$(nsenter --mount=/proc/1/ns/mnt -- \
+                mount "UUID=${uuid}" "${mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
+        else
+            mount_out=$(nsenter --mount=/proc/1/ns/mnt -- \
+                mount -t "${fstype}" "UUID=${uuid}" "${mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
+        fi
     else
-        mount_out=$(mount -t "${fstype}" "UUID=${uuid}" "${container_mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
+        log_info "[${i}] nsenter unavailable, trying direct container mount at ${container_mount_point}"
+        if [ "${fstype}" = "auto" ]; then
+            mount_out=$(mount "UUID=${uuid}" "${container_mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
+        else
+            mount_out=$(mount -t "${fstype}" "UUID=${uuid}" "${container_mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
+        fi
     fi
 
     if [ "${mount_exit}" -eq 0 ]; then

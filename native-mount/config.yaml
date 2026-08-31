@@ -4,7 +4,7 @@ description: >-
   then optionally runs post-mount shell commands (e.g. to start another add-on).
   Runs at the initialize stage so drives are ready before application-stage
   add-ons (like Frigate) start.
-version: "0.5.0"
+version: "0.6.0"
 slug: native_mount
 url: https://github.com/kael-shipman/ha-addon-native-mount
 arch:
@@ -17,9 +17,14 @@ arch:
 startup: initialize
 boot: auto
 
-# full_access exposes all host block devices inside the container (/dev/disk/by-uuid/...).
-# SYS_ADMIN is required to perform mount operations.
+# host_pid: /proc/1 refers to the host's PID 1, giving access to /proc/1/ns/mnt for nsenter.
+# SYS_ADMIN: perform mount operations. SYS_PTRACE: open /proc/1/ns/mnt for nsenter.
+# full_access: exposes host block devices + disables seccomp (needed for blkid + mount).
+host_pid: true
 full_access: true
+privileged:
+  - SYS_ADMIN
+  - SYS_PTRACE
 
 # /media and /share are bind-mounted with shared propagation by the HA Supervisor,
 # so mounts done here propagate to the host and to other add-on containers.
