@@ -4,7 +4,7 @@ description: >-
   then optionally runs post-mount shell commands (e.g. to start another add-on).
   Runs at the initialize stage so drives are ready before application-stage
   add-ons (like Frigate) start.
-version: "0.8.0"
+version: "0.9.0"
 slug: native_mount
 url: https://github.com/kael-shipman/ha-addon-native-mount
 arch:
