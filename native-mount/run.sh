@@ -1,12 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
+ENTITY_UPDATE_INTERVAL=900  # 15 minutes
+
 log_info()    { echo "[$(date '+%H:%M:%S')] [INFO]    native-mount: $*"; }
 log_warning() { echo "[$(date '+%H:%M:%S')] [WARNING] native-mount: $*"; }
 log_error()   { echo "[$(date '+%H:%M:%S')] [ERROR]   native-mount: $*" >&2; }
 
-# Thin wrapper for `ha addons|addon start|stop|restart <slug>`.
-# Calls the Supervisor REST API; requires hassio_api: true + hassio_role: manager.
+trap 'log_info "shutting down"; exit 0' TERM INT
+
+# Thin `ha addons|addon start|stop|restart <slug>` wrapper over the Supervisor API.
 ha() {
     local cmd="${1:-}" sub="${2:-}" slug="${3:-}"
     if [ "${cmd}" != "addons" ] && [ "${cmd}" != "addon" ]; then
@@ -36,12 +39,91 @@ run_commands() {
     done
 }
 
+# Push mount state and disk usage to the HA Core state machine.
+# Entity ID: sensor.native_mount_<first 8 hex chars of UUID>
+# No external dependencies — uses the Supervisor API proxy to Core.
+update_entity() {
+    local idx="$1" uuid="$2" mount_point="$3"
+    local entity_id="sensor.native_mount_$(printf '%s' "${uuid}" | tr -d '-' | cut -c1-8)"
+    local label; label=$(basename "${mount_point}")
+
+    local state="unmounted"
+    local device="" total_gb="" used_gb="" usage_pct=""
+
+    if nsenter --mount=/proc/1/ns/mnt -- findmnt -n "${mount_point}" >/dev/null 2>&1; then
+        state="mounted"
+        device=$(blkid -U "${uuid}" 2>/dev/null || true)
+
+        # df in the host namespace so we read the actual mounted volume.
+        local df_line
+        df_line=$(nsenter --mount=/proc/1/ns/mnt -- df -k "${mount_point}" 2>/dev/null | awk 'NR==2')
+        if [ -n "${df_line}" ]; then
+            local tkb ukb
+            tkb=$(echo "${df_line}" | awk '{print $2}')
+            ukb=$(echo "${df_line}" | awk '{print $3}')
+            total_gb=$(awk "BEGIN{printf \"%.2f\", ${tkb}/1048576}")
+            used_gb=$(awk  "BEGIN{printf \"%.2f\", ${ukb}/1048576}")
+            usage_pct=$(awk "BEGIN{printf \"%.1f\", ${ukb}*100/${tkb}}")
+        fi
+    fi
+
+    # Build JSON with jq so all values are properly escaped and typed.
+    local payload
+    payload=$(jq -n \
+        --arg state "${state}" \
+        --arg name  "Native Mount: ${label}" \
+        --arg uuid  "${uuid}" \
+        --arg mp    "${mount_point}" \
+        --arg dev   "${device}" \
+        --arg tgb   "${total_gb}" \
+        --arg ugb   "${used_gb}" \
+        --arg pct   "${usage_pct}" \
+        '{
+            state: $state,
+            attributes: {
+                friendly_name:  $name,
+                uuid:           $uuid,
+                mount_point:    $mp,
+                device:         (if $dev == "" then null else $dev end),
+                total_gb:       (if $tgb == "" then null else ($tgb | tonumber) end),
+                used_gb:        (if $ugb == "" then null else ($ugb | tonumber) end),
+                usage_percent:  (if $pct == "" then null else ($pct | tonumber) end),
+                icon:           "mdi:harddisk"
+            }
+        }')
+
+    if curl -sf -X POST \
+        -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "${payload}" \
+        "http://supervisor/core/api/states/${entity_id}" >/dev/null; then
+        if [ "${state}" = "mounted" ]; then
+            log_info "[${idx}] entity ${entity_id}: ${state}, ${used_gb} / ${total_gb} GB (${usage_pct}%)"
+        else
+            log_info "[${idx}] entity ${entity_id}: ${state}"
+        fi
+    else
+        log_warning "[${idx}] failed to update entity ${entity_id} — is HA Core running?"
+    fi
+}
+
+update_all_entities() {
+    local count="$1"
+    for i in $(seq 0 $((count - 1))); do
+        update_entity "${i}" \
+            "$(jq -r ".mounts[${i}].device_uuid" "${CONFIG}")" \
+            "$(jq -r ".mounts[${i}].mount_point"  "${CONFIG}")"
+    done
+}
+
 CONFIG="/data/options.json"
 
 log_info "starting"
 
 mount_count=$(jq 'if .mounts then .mounts | length else 0 end' "${CONFIG}")
 log_info "${mount_count} mount(s) configured"
+
+# ── Mount phase ────────────────────────────────────────────────────────────────
 
 for i in $(seq 0 $((mount_count - 1))); do
     uuid=$(jq -r ".mounts[${i}].device_uuid" "${CONFIG}")
@@ -55,7 +137,6 @@ for i in $(seq 0 $((mount_count - 1))); do
         log_info "[${i}] Attempting to mount UUID=${uuid} -> ${mount_point} as ${fstype} (Waiting up to ${wait_timeout}s for device to appear)"
     fi
 
-    # Poll for device using blkid (doesn't require udev by-uuid symlinks to exist yet).
     elapsed=0
     device_found=true
     until blkid -U "${uuid}" >/dev/null 2>&1; do
@@ -77,17 +158,12 @@ for i in $(seq 0 $((mount_count - 1))); do
 
     log_info "[${i}] device found after ${elapsed}s ($(blkid -U "${uuid}"))"
 
-    # Skip if already mounted at this mount point (handles add-on running multiple
-    # times during boot, or a manual restart without reboot).
     if nsenter --mount=/proc/1/ns/mnt -- findmnt -n "${mount_point}" >/dev/null 2>&1; then
         log_info "[${i}] ${mount_point} is already mounted — skipping"
         run_commands "[${i}] on_success" ".mounts[${i}].on_success"
         continue
     fi
 
-    # Mount in the host's mount namespace so the result is visible to all host
-    # processes and add-on containers (including Frigate).
-    # Requires: host_pid: true, apparmor: false, privileged: [SYS_ADMIN, SYS_PTRACE]
     if [ "${fstype}" = "auto" ]; then
         mount_out=$(nsenter --mount=/proc/1/ns/mnt -- \
             mount "UUID=${uuid}" "${mount_point}" 2>&1) && mount_exit=0 || mount_exit=$?
@@ -107,4 +183,19 @@ done
 
 run_commands "post_mount" ".post_mount_ha_commands"
 
-log_info "done"
+# ── Entity update loop ─────────────────────────────────────────────────────────
+
+if [ "${mount_count}" -eq 0 ]; then
+    log_info "no mounts configured — nothing to report"
+    exit 0
+fi
+
+log_info "publishing initial entity state(s)"
+update_all_entities "${mount_count}"
+
+log_info "entering entity update loop (every $((ENTITY_UPDATE_INTERVAL / 60)) min)"
+while true; do
+    sleep "${ENTITY_UPDATE_INTERVAL}"
+    log_info "updating entity state(s)"
+    update_all_entities "${mount_count}"
+done

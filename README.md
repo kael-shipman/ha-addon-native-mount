@@ -251,6 +251,64 @@ Check that:
 
 ---
 
+## Mount state entities
+
+After mounting, the add-on publishes a `sensor` entity to HA for each configured
+mount and keeps it updated every 15 minutes. No additional add-ons or
+dependencies are required — entity state is written directly to the HA Core state
+machine via the Supervisor API.
+
+### Entity details
+
+| Field | Value |
+|---|---|
+| **Entity ID** | `sensor.native_mount_<first 8 chars of UUID>` e.g. `sensor.native_mount_f2f5ddc6` |
+| **State** | `mounted` or `unmounted` |
+| **Attributes** | `uuid`, `mount_point`, `device`, `total_gb`, `used_gb`, `usage_percent` |
+| **Update interval** | Every 15 minutes (immediately on startup) |
+| **Icon** | `mdi:harddisk` |
+
+### Using entities in automations
+
+Because each mount has a corresponding sensor, you can write HA automations that
+react to mount state. For example, start Frigate only when the drive is confirmed
+mounted (useful if you prefer `boot: manual` for Frigate):
+
+```yaml
+automation:
+  - alias: Start Frigate when drive is mounted
+    trigger:
+      - platform: state
+        entity_id: sensor.native_mount_f2f5ddc6
+        to: mounted
+    action:
+      - service: hassio.addon_start
+        data:
+          addon: ccab4aaf_frigate
+```
+
+Or alert when a drive goes missing:
+
+```yaml
+automation:
+  - alias: Alert when Frigate drive is unmounted
+    trigger:
+      - platform: state
+        entity_id: sensor.native_mount_f2f5ddc6
+        to: unmounted
+    action:
+      - service: notify.mobile_app
+        data:
+          message: "Frigate external drive is not mounted!"
+```
+
+> **Note:** There is no native mechanism in Home Assistant to declare add-on
+> dependencies. The entity reporting feature in this add-on has no external
+> dependencies — it talks directly to the HA Core API. No MQTT broker or any other
+> add-on is required.
+
+---
+
 ## Contributing / development
 
 The repository layout is standard for HA custom add-on repositories:
