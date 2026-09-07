@@ -3,6 +3,10 @@ set -euo pipefail
 
 ENTITY_UPDATE_INTERVAL=900  # 15 minutes
 
+# homeassistant_api: true in config sets HOMEASSISTANT_TOKEN to Core's internal API token.
+# Without that flag only SUPERVISOR_TOKEN is available, which the Core proxy rejects.
+CORE_API_TOKEN="${HOMEASSISTANT_TOKEN:-${SUPERVISOR_TOKEN:-}}"
+
 log_info()    { echo "[$(date '+%H:%M:%S')] [INFO]    native-mount: $*"; }
 log_warning() { echo "[$(date '+%H:%M:%S')] [WARNING] native-mount: $*"; }
 log_error()   { echo "[$(date '+%H:%M:%S')] [ERROR]   native-mount: $*" >&2; }
@@ -93,7 +97,7 @@ update_entity() {
         }')
 
     if curl -sf -X POST \
-        -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+        -H "Authorization: Bearer ${CORE_API_TOKEN}" \
         -H "Content-Type: application/json" \
         -d "${payload}" \
         "http://supervisor/core/api/states/${entity_id}" >/dev/null; then
@@ -119,6 +123,11 @@ update_all_entities() {
 CONFIG="/data/options.json"
 
 log_info "starting"
+if [ -n "${HOMEASSISTANT_TOKEN:-}" ]; then
+    log_info "HOMEASSISTANT_TOKEN present — will use for Core API calls"
+else
+    log_warning "HOMEASSISTANT_TOKEN absent — Core API calls may fail (homeassistant_api: true required)"
+fi
 
 mount_count=$(jq 'if .mounts then .mounts | length else 0 end' "${CONFIG}")
 log_info "${mount_count} mount(s) configured"
@@ -196,7 +205,7 @@ log_info "waiting for HA Core to be ready..."
 core_wait=0
 core_max=600  # 10 minutes
 until curl -sf \
-    -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+    -H "Authorization: Bearer ${CORE_API_TOKEN}" \
     "http://supervisor/core/api/" >/dev/null 2>&1; do
     if [ "${core_wait}" -ge "${core_max}" ]; then
         log_warning "HA Core did not become ready within ${core_max}s — entities will appear on next update cycle"
