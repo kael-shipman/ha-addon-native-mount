@@ -190,6 +190,23 @@ if [ "${mount_count}" -eq 0 ]; then
     exit 0
 fi
 
+# The add-on runs at the initialize stage, before HA Core starts. Wait until
+# Core is responding before publishing entities.
+log_info "waiting for HA Core to be ready..."
+core_wait=0
+core_max=600  # 10 minutes
+until curl -sf \
+    -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+    "http://supervisor/core/api/" >/dev/null 2>&1; do
+    if [ "${core_wait}" -ge "${core_max}" ]; then
+        log_warning "HA Core did not become ready within ${core_max}s — entities will appear on next update cycle"
+        break
+    fi
+    sleep 15
+    core_wait=$((core_wait + 15))
+done
+[ "${core_wait}" -lt "${core_max}" ] && log_info "HA Core ready after ${core_wait}s"
+
 log_info "publishing initial entity state(s)"
 update_all_entities "${mount_count}"
 
