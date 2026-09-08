@@ -197,10 +197,88 @@ This add-on requires elevated privileges in order to perform host-level mounts:
 | `privileged: [SYS_ADMIN]` | Required to call `mount(2)` |
 | `privileged: [SYS_PTRACE]` | Required to open `/proc/1/ns/mnt` (a ptrace-protected file) |
 | `full_access: true` | Exposes host block devices (e.g. `/dev/sdb1`) inside the container for device detection |
-| `hassio_role: manager` | Required to call the Supervisor API for `ha addons start/stop` |
+| `hassio_api: true` + `hassio_role: manager` | Required to call the Supervisor API for `ha addons start/stop` |
+| `homeassistant_api: true` | Required to proxy entity state writes to the HA Core REST API |
 
 These are the minimum permissions needed for the add-on to function. The add-on
-performs no network access and only reads/writes the mount points you configure.
+performs no network access beyond the local Supervisor and Core APIs, and only
+reads/writes the mount points you configure.
+
+---
+
+## Mount state entities
+
+After mounting, the add-on publishes a `sensor` entity to HA for each configured
+mount and keeps it updated every 15 minutes. No additional add-ons or
+dependencies are required — entity state is written directly to the HA Core state
+machine via the Supervisor API.
+
+### Entity details
+
+| Field | Value |
+|---|---|
+| **Entity ID** | `sensor.native_mount_<first 8 hex chars of UUID>` e.g. `sensor.native_mount_f2f5ddc6` |
+| **State** | `mounted` or `unmounted` |
+| **Attributes** | `uuid`, `mount_point`, `device`, `total_gb`, `used_gb`, `usage_percent` |
+| **Update interval** | Every 15 minutes (immediately on startup) |
+| **Icon** | `mdi:harddisk` |
+
+### Using entities in automations
+
+**Start Frigate only when the drive is confirmed mounted:**
+
+```yaml
+automation:
+  - alias: Start Frigate when drive is mounted
+    trigger:
+      - platform: state
+        entity_id: sensor.native_mount_f2f5ddc6
+        to: mounted
+    action:
+      - service: hassio.addon_start
+        data:
+          addon: ccab4aaf_frigate
+```
+
+**Alert when a drive goes missing:**
+
+```yaml
+automation:
+  - alias: Alert when Frigate drive is unmounted
+    trigger:
+      - platform: state
+        entity_id: sensor.native_mount_f2f5ddc6
+        to: unmounted
+    action:
+      - service: notify.mobile_app
+        data:
+          message: "Frigate external drive is not mounted!"
+```
+
+**Notify when storage is getting full (replace `82` with your preferred threshold):**
+
+```yaml
+automation:
+  - alias: Notify when Frigate drive storage is high
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.native_mount_f2f5ddc6
+        attribute: usage_percent
+        above: 82
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Drive Storage Warning"
+          message: >
+            Frigate drive usage has reached
+            {{ state_attr('sensor.native_mount_f2f5ddc6', 'usage_percent') }}%
+            — consider freeing space or expanding storage.
+```
+
+> **Note:** There is no native mechanism in Home Assistant to declare add-on
+> dependencies. The entity reporting feature in this add-on has no external
+> dependencies — it talks directly to the HA Core API. No MQTT broker or any other
+> add-on is required.
 
 ---
 
@@ -233,6 +311,15 @@ Check that:
   logs).
 - The mount point directory exists on the host at the path you configured.
 
+**"Login attempt with invalid authentication" notification**
+
+After entity state updates, HA Core may show a notification about an invalid
+authentication attempt from the add-on's container IP. This is a known audit
+artifact of the Supervisor proxy mechanism — the entity state **is** published
+correctly, and no security breach has occurred. See
+[issue #1](https://github.com/kael-shipman/ha-addon-native-mount/issues/1) for
+context and planned fixes.
+
 ---
 
 ## Limitations
@@ -248,64 +335,10 @@ Check that:
   references another add-on (e.g. Mosquitto for a future MQTT feature), that
   add-on must be installed separately. The add-on will log a clear error if a
   required add-on is not available.
-
----
-
-## Mount state entities
-
-After mounting, the add-on publishes a `sensor` entity to HA for each configured
-mount and keeps it updated every 15 minutes. No additional add-ons or
-dependencies are required — entity state is written directly to the HA Core state
-machine via the Supervisor API.
-
-### Entity details
-
-| Field | Value |
-|---|---|
-| **Entity ID** | `sensor.native_mount_<first 8 chars of UUID>` e.g. `sensor.native_mount_f2f5ddc6` |
-| **State** | `mounted` or `unmounted` |
-| **Attributes** | `uuid`, `mount_point`, `device`, `total_gb`, `used_gb`, `usage_percent` |
-| **Update interval** | Every 15 minutes (immediately on startup) |
-| **Icon** | `mdi:harddisk` |
-
-### Using entities in automations
-
-Because each mount has a corresponding sensor, you can write HA automations that
-react to mount state. For example, start Frigate only when the drive is confirmed
-mounted (useful if you prefer `boot: manual` for Frigate):
-
-```yaml
-automation:
-  - alias: Start Frigate when drive is mounted
-    trigger:
-      - platform: state
-        entity_id: sensor.native_mount_f2f5ddc6
-        to: mounted
-    action:
-      - service: hassio.addon_start
-        data:
-          addon: ccab4aaf_frigate
-```
-
-Or alert when a drive goes missing:
-
-```yaml
-automation:
-  - alias: Alert when Frigate drive is unmounted
-    trigger:
-      - platform: state
-        entity_id: sensor.native_mount_f2f5ddc6
-        to: unmounted
-    action:
-      - service: notify.mobile_app
-        data:
-          message: "Frigate external drive is not mounted!"
-```
-
-> **Note:** There is no native mechanism in Home Assistant to declare add-on
-> dependencies. The entity reporting feature in this add-on has no external
-> dependencies — it talks directly to the HA Core API. No MQTT broker or any other
-> add-on is required.
+- Each entity state update generates a "Login attempt with invalid authentication"
+  notification in HA Core. This is a cosmetic audit artifact of the Supervisor's
+  Core API proxy mechanism — entity data is correct and no actual auth failure
+  occurs. See [issue #1](https://github.com/kael-shipman/ha-addon-native-mount/issues/1).
 
 ---
 
@@ -323,4 +356,6 @@ ha-addon-native-mount/
 ```
 
 To iterate locally: push a version bump to GitHub, then from a host SSH session
-run `ha store reload && ha apps update native_mount` to pull and rebuild.
+run `ha store reload && ha apps update <slug>` to pull and rebuild. The slug is
+visible in the add-on store URL (e.g. `2e6ea408_native_mount` for this
+repository).
