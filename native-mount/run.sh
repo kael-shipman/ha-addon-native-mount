@@ -123,10 +123,8 @@ update_all_entities() {
 CONFIG="/data/options.json"
 
 log_info "starting"
-if [ -n "${HOMEASSISTANT_TOKEN:-}" ]; then
-    log_info "HOMEASSISTANT_TOKEN present — will use for Core API calls"
-else
-    log_warning "HOMEASSISTANT_TOKEN absent — Core API calls may fail (homeassistant_api: true required)"
+if [ -z "${CORE_API_TOKEN}" ]; then
+    log_error "no API token available — entity updates will not work"
 fi
 
 mount_count=$(jq 'if .mounts then .mounts | length else 0 end' "${CONFIG}")
