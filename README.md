@@ -80,8 +80,11 @@ mounts:
 ```
 
 **Start Frigate once the drive is mounted** (Frigate set to `boot: manual`).
-At boot the mount entity typically appears before the Supervisor will accept
-start requests, so the start is retried every 30 s for up to ~10 min:
+Both triggers matter: at boot the entity is often restored before automations
+are armed, so only `homeassistant: start` catches it; the state trigger covers
+a drive that mounts later. The entity also typically appears before the
+Supervisor will accept start requests, so the start is retried every 30 s for
+up to ~10 min:
 
 ```yaml
 alias: Frigate – Start When Drive Mounted
@@ -274,13 +277,14 @@ MQTT → Configure → Listen to a topic* (`native_mount/#`):
 
 ### Timing semantics (important for automations)
 
-- **Boot:** drives are mounted first; the entity appears once both the broker
-  and HA's MQTT integration are up. Its first appearance as `mounted` is a
-  state change, so a `to: mounted` trigger fires on every boot.
-- **Core restarts:** the entity reappears with its current state within a
-  second or two of HA's MQTT integration reconnecting (the broker replays the
-  retained messages). That is also a state change, so `to: mounted` triggers
-  fire after a Core-only restart too.
+- **Boot and Core restarts:** the entity reappears with its current state
+  within a few seconds of HA's MQTT integration connecting (the broker replays
+  the retained messages). This can happen **before automations are armed**, in
+  which case a `to: mounted` state trigger never sees the change. Any
+  automation that must act on the mount at startup therefore needs a
+  `homeassistant: start` trigger plus a `state: mounted` condition (as in the
+  [Frigate example](#common-use-case-frigate-nvr-recordings-on-an-external-drive)),
+  with the state trigger covering mounts that appear later.
 - **Add-on stopped or crashed:** the entity becomes `unavailable` (graceful
   shutdown publishes `offline`; a crash triggers the broker-held last will).
   When the add-on comes back, `unavailable` → `mounted` also fires `to: mounted`.
