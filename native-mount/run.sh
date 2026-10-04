@@ -85,28 +85,30 @@ trap shutdown TERM INT
 # Entity ID: sensor.native_mount_<first 8 hex chars of UUID>
 short_id() { printf '%s' "$1" | tr -d '-' | cut -c1-8; }
 
-# Retained discovery config: HA's MQTT integration creates a registry-backed
-# entity (with a device) from this and recreates it after every Core restart.
+# Discovery object IDs published for each mount. Also drives orphan cleanup, so
+# every entity a mount owns must be listed here.
+#   ""            → sensor.native_mount_<id>             (mounted / unmounted)
+#   _disk_used    → sensor.native_mount_<id>_disk_used   (GiB)
+#   _disk_total   → sensor.native_mount_<id>_disk_total  (GiB)
+#   _disk_usage   → sensor.native_mount_<id>_disk_usage  (%)
+ENTITY_SUFFIXES=("" "_disk_used" "_disk_total" "_disk_usage")
+
+# Retained discovery configs: HA's MQTT integration creates registry-backed
+# entities (sharing one device per mount) from these and recreates them after
+# every Core restart.
 publish_discovery() {
     local uuid="$1" mount_point="$2"
     local id; id=$(short_id "${uuid}")
     local label; label=$(basename "${mount_point}")
+    local state_topic="${BASE_TOPIC}/${id}/state"
+    local usage_topic="${BASE_TOPIC}/${id}/usage"
 
-    local config
-    config=$(jq -nc \
+    local common
+    common=$(jq -nc \
         --arg id "${id}" \
         --arg name "Native Mount: ${label}" \
-        --arg base "${BASE_TOPIC}" \
-        --arg avail "${AVAILABILITY_TOPIC}" \
         --arg ver "${VERSION}" \
         '{
-            name: null,
-            unique_id: "native_mount_\($id)",
-            default_entity_id: "sensor.native_mount_\($id)",
-            state_topic: "\($base)/\($id)/state",
-            json_attributes_topic: "\($base)/\($id)/attributes",
-            availability_topic: $avail,
-            icon: "mdi:harddisk",
             device: {
                 identifiers: ["native_mount_\($id)"],
                 name: $name,
@@ -120,7 +122,75 @@ publish_discovery() {
                 support_url: "https://github.com/kael-shipman/ha-addon-native-mount"
             }
         }')
-    mqtt_pub "${DISCOVERY_PREFIX}/sensor/native_mount_${id}/config" "${config}"
+
+    # Mount state. Its name is null, so it takes the device name.
+    local mount_config
+    mount_config=$(jq -nc \
+        --argjson common "${common}" \
+        --arg id "${id}" \
+        --arg state "${state_topic}" \
+        --arg attrs "${BASE_TOPIC}/${id}/attributes" \
+        --arg avail "${AVAILABILITY_TOPIC}" \
+        '$common + {
+            name: null,
+            unique_id: "native_mount_\($id)",
+            default_entity_id: "sensor.native_mount_\($id)",
+            state_topic: $state,
+            json_attributes_topic: $attrs,
+            availability_topic: $avail,
+            icon: "mdi:harddisk"
+        }')
+    mqtt_pub "${DISCOVERY_PREFIX}/sensor/native_mount_${id}/config" "${mount_config}" || return 1
+
+    # Disk sensors. Available only while the add-on is online AND the drive is
+    # mounted, so an unplugged drive reads "unavailable", never a stale number.
+    local spec suffix name key unit device_class icon cfg
+    for spec in \
+        "_disk_used|Disk used|used|GiB|data_size|mdi:harddisk" \
+        "_disk_total|Disk total|total|GiB|data_size|mdi:harddisk" \
+        "_disk_usage|Disk usage|percent|%||mdi:gauge"; do
+        IFS='|' read -r suffix name key unit device_class icon <<<"${spec}"
+        cfg=$(jq -nc \
+            --argjson common "${common}" \
+            --arg id "${id}" \
+            --arg suffix "${suffix}" \
+            --arg name "${name}" \
+            --arg key "${key}" \
+            --arg unit "${unit}" \
+            --arg dc "${device_class}" \
+            --arg icon "${icon}" \
+            --arg usage "${usage_topic}" \
+            --arg state "${state_topic}" \
+            --arg avail "${AVAILABILITY_TOPIC}" \
+            '$common + {
+                name: $name,
+                unique_id: "native_mount_\($id)\($suffix)",
+                default_entity_id: "sensor.native_mount_\($id)\($suffix)",
+                state_topic: $usage,
+                value_template: "{{ value_json.\($key) }}",
+                unit_of_measurement: $unit,
+                state_class: "measurement",
+                suggested_display_precision: 1,
+                icon: $icon,
+                availability: [
+                    { topic: $avail },
+                    { topic: $state, payload_available: "mounted", payload_not_available: "unmounted" }
+                ],
+                availability_mode: "all"
+            } + (if $dc == "" then {} else { device_class: $dc } end)')
+        mqtt_pub "${DISCOVERY_PREFIX}/sensor/native_mount_${id}${suffix}/config" "${cfg}" || return 1
+    done
+}
+
+# Empty retained payloads make HA delete the entities and the broker drop the data.
+clear_mount_topics() {
+    local id="$1" suffix topic
+    for suffix in "${ENTITY_SUFFIXES[@]}"; do
+        mqtt_pub "${DISCOVERY_PREFIX}/sensor/native_mount_${id}${suffix}/config" "" || return 1
+    done
+    for topic in state usage attributes; do
+        mqtt_pub "${BASE_TOPIC}/${id}/${topic}" "" || return 1
+    done
 }
 
 # Clear retained discovery/state for mounts that were removed from the config,
@@ -132,11 +202,11 @@ cleanup_removed_mounts() {
     while IFS= read -r id; do
         [ -z "${id}" ] && continue
         if ! grep -qx "${id}" <<<"${current}"; then
-            log_info "removing entity for unconfigured mount ${id}"
-            mqtt_pub "${DISCOVERY_PREFIX}/sensor/native_mount_${id}/config" "" \
-                && mqtt_pub "${BASE_TOPIC}/${id}/state" "" \
-                && mqtt_pub "${BASE_TOPIC}/${id}/attributes" "" \
-                || { log_warning "failed to clear entity for ${id} — will retry next start"; rc=1; }
+            log_info "removing entities for unconfigured mount ${id}"
+            if ! clear_mount_topics "${id}"; then
+                log_warning "failed to clear entities for ${id} — will retry next start"
+                rc=1
+            fi
         fi
     done <"${PUBLISHED_IDS_FILE}"
     return "${rc}"
@@ -148,7 +218,7 @@ update_entity() {
     local id; id=$(short_id "${uuid}")
 
     local state="unmounted"
-    local device="" total_gb="" used_gb="" usage_pct=""
+    local device="" total_gib="" used_gib="" usage_pct=""
 
     if nsenter --mount=/proc/1/ns/mnt -- findmnt -n "${mount_point}" >/dev/null 2>&1; then
         state="mounted"
@@ -161,8 +231,9 @@ update_entity() {
             local tkb ukb
             tkb=$(echo "${df_line}" | awk '{print $2}')
             ukb=$(echo "${df_line}" | awk '{print $3}')
-            total_gb=$(awk "BEGIN{printf \"%.2f\", ${tkb}/1048576}")
-            used_gb=$(awk  "BEGIN{printf \"%.2f\", ${ukb}/1048576}")
+            # df -k reports KiB; / 1048576 gives GiB.
+            total_gib=$(awk "BEGIN{printf \"%.2f\", ${tkb}/1048576}")
+            used_gib=$(awk  "BEGIN{printf \"%.2f\", ${ukb}/1048576}")
             usage_pct=$(awk "BEGIN{printf \"%.1f\", ${ukb}*100/${tkb}}")
         fi
     fi
@@ -173,8 +244,8 @@ update_entity() {
         --arg uuid  "${uuid}" \
         --arg mp    "${mount_point}" \
         --arg dev   "${device}" \
-        --arg tgb   "${total_gb}" \
-        --arg ugb   "${used_gb}" \
+        --arg tgb   "${total_gib}" \
+        --arg ugb   "${used_gib}" \
         --arg pct   "${usage_pct}" \
         '{
             uuid:           $uuid,
@@ -185,11 +256,22 @@ update_entity() {
             usage_percent:  (if $pct == "" then null else ($pct | tonumber) end)
         }')
 
-    # Attributes first, so a state-triggered automation sees fresh attributes.
-    if mqtt_pub "${BASE_TOPIC}/${id}/attributes" "${attributes}" \
+    # Disk usage for the disk sensors, only while mounted (otherwise the sensors
+    # are unavailable via the state topic and keep their last retained value).
+    local publish_ok=true
+    if [ "${state}" = "mounted" ] && [ -n "${usage_pct}" ]; then
+        local usage
+        usage=$(jq -nc --arg u "${used_gib}" --arg t "${total_gib}" --arg p "${usage_pct}" \
+            '{used: ($u | tonumber), total: ($t | tonumber), percent: ($p | tonumber)}')
+        mqtt_pub "${BASE_TOPIC}/${id}/usage" "${usage}" || publish_ok=false
+    fi
+
+    # Data before state, so anything reacting to "mounted" sees fresh values.
+    if [ "${publish_ok}" = true ] \
+        && mqtt_pub "${BASE_TOPIC}/${id}/attributes" "${attributes}" \
         && mqtt_pub "${BASE_TOPIC}/${id}/state" "${state}"; then
         local summary="${state}"
-        [ "${state}" = "mounted" ] && summary="${state}, ${used_gb} / ${total_gb} GB (${usage_pct}%)"
+        [ "${state}" = "mounted" ] && summary="${state}, ${used_gib} / ${total_gib} GiB (${usage_pct}%)"
         # Only log changes; a once-a-minute heartbeat would drown the log.
         if [ "${summary%%,*}" != "${LAST_STATE[${idx}]:-}" ]; then
             log_info "[${idx}] sensor.native_mount_${id}: ${summary}"
