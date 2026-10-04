@@ -129,14 +129,12 @@ publish_discovery() {
         --argjson common "${common}" \
         --arg id "${id}" \
         --arg state "${state_topic}" \
-        --arg attrs "${BASE_TOPIC}/${id}/attributes" \
         --arg avail "${AVAILABILITY_TOPIC}" \
         '$common + {
             name: null,
             unique_id: "native_mount_\($id)",
             default_entity_id: "sensor.native_mount_\($id)",
             state_topic: $state,
-            json_attributes_topic: $attrs,
             availability_topic: $avail,
             icon: "mdi:harddisk"
         }')
@@ -188,6 +186,7 @@ clear_mount_topics() {
     for suffix in "${ENTITY_SUFFIXES[@]}"; do
         mqtt_pub "${DISCOVERY_PREFIX}/sensor/native_mount_${id}${suffix}/config" "" || return 1
     done
+    # "attributes" was only published before 5.0.0; still cleared for old mounts.
     for topic in state usage attributes; do
         mqtt_pub "${BASE_TOPIC}/${id}/${topic}" "" || return 1
     done
@@ -218,11 +217,10 @@ update_entity() {
     local id; id=$(short_id "${uuid}")
 
     local state="unmounted"
-    local device="" total_gib="" used_gib="" usage_pct=""
+    local total_gib="" used_gib="" usage_pct=""
 
     if nsenter --mount=/proc/1/ns/mnt -- findmnt -n "${mount_point}" >/dev/null 2>&1; then
         state="mounted"
-        device=$(blkid -U "${uuid}" 2>/dev/null || true)
 
         # df in the host namespace so we read the actual mounted volume.
         local df_line
@@ -238,24 +236,6 @@ update_entity() {
         fi
     fi
 
-    # Build JSON with jq so all values are properly escaped and typed.
-    local attributes
-    attributes=$(jq -nc \
-        --arg uuid  "${uuid}" \
-        --arg mp    "${mount_point}" \
-        --arg dev   "${device}" \
-        --arg tgb   "${total_gib}" \
-        --arg ugb   "${used_gib}" \
-        --arg pct   "${usage_pct}" \
-        '{
-            uuid:           $uuid,
-            mount_point:    $mp,
-            device:         (if $dev == "" then null else $dev end),
-            total_gb:       (if $tgb == "" then null else ($tgb | tonumber) end),
-            used_gb:        (if $ugb == "" then null else ($ugb | tonumber) end),
-            usage_percent:  (if $pct == "" then null else ($pct | tonumber) end)
-        }')
-
     # Disk usage for the disk sensors, only while mounted (otherwise the sensors
     # are unavailable via the state topic and keep their last retained value).
     local publish_ok=true
@@ -268,7 +248,6 @@ update_entity() {
 
     # Data before state, so anything reacting to "mounted" sees fresh values.
     if [ "${publish_ok}" = true ] \
-        && mqtt_pub "${BASE_TOPIC}/${id}/attributes" "${attributes}" \
         && mqtt_pub "${BASE_TOPIC}/${id}/state" "${state}"; then
         local summary="${state}"
         [ "${state}" = "mounted" ] && summary="${state}, ${used_gib} / ${total_gib} GiB (${usage_pct}%)"
@@ -384,6 +363,11 @@ if [ "${mount_count}" -eq 0 ]; then
     log_info "no mounts configured — nothing to report"
 else
     log_info "publishing discovery config for ${mount_count} mount(s)"
+    # Versions before 5.0.0 published retained JSON attributes; drop them from
+    # the broker. Harmless no-op once they're gone.
+    while IFS= read -r id; do
+        [ -n "${id}" ] && { mqtt_pub "${BASE_TOPIC}/${id}/attributes" "" || true; }
+    done <<<"${current_ids}"
 fi
 
 log_info "entering update loop (every ${ENTITY_UPDATE_INTERVAL}s; state changes are logged)"

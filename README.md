@@ -202,11 +202,30 @@ mounts:
 
 | Option | Required | Default | Description |
 |---|---|---|---|
-| `mounts` | Yes | `[]` | List of drives to mount. Each produces one entity. |
+| `mounts` | Yes | `[]` | List of drives to mount. Each produces one device with four sensors (see [Entities](#entities)). |
 | `mounts[].device_uuid` | Yes | — | Filesystem UUID of the partition (`blkid` output). |
 | `mounts[].mount_point` | Yes | — | Absolute host path to mount onto. Must exist before the add-on runs — create it once from a host SSH session. |
 | `mounts[].fstype` | No | auto | Filesystem type (`ext4`, `exfat`, `ntfs`, etc.). Omit for auto-detection. |
 | `mounts[].wait_timeout` | No | 30 | Seconds to wait for the device to appear. USB drives may take a few seconds on boot. |
+
+### Upgrading from 4.x
+
+Version 5.0.0 removes the JSON **attributes** (`uuid`, `mount_point`, `device`,
+`total_gb`, `used_gb`, `usage_percent`) from `sensor.native_mount_<id>`. Disk
+usage is now three proper sensors, added in 4.1.0 (see
+[Entities](#entities)). Before updating, switch anything that reads the
+attributes to the sensors:
+
+| Was | Now |
+|---|---|
+| `state_attr('sensor.native_mount_<id>', 'usage_percent')` | `states('sensor.native_mount_<id>_disk_usage')` |
+| `state_attr('sensor.native_mount_<id>', 'used_gb')` | `states('sensor.native_mount_<id>_disk_used')` |
+| `state_attr('sensor.native_mount_<id>', 'total_gb')` | `states('sensor.native_mount_<id>_disk_total')` |
+| `numeric_state` trigger with `attribute: usage_percent` | `numeric_state` trigger on `sensor.native_mount_<id>_disk_usage` |
+
+The old `_gb` attributes were actually GiB; the new sensors say so. `uuid`,
+`mount_point` and `device` have no replacement. They're in the add-on's
+configuration and log.
 
 ### Upgrading from 3.x
 
@@ -249,30 +268,41 @@ Look for your drive by label, size, or type. The `UUID=` value is what you need.
 
 ## Mount state entities
 
-For each configured mount, the add-on publishes a `sensor` entity via MQTT
-discovery and refreshes it every 60 seconds. Each mount also gets its own
-device ("Native Mount: <mount-point name>"), so the entity is a normal,
-registry-backed HA entity: you can rename it, assign it an area, and label it.
+For each configured mount, the add-on publishes four `sensor` entities via MQTT
+discovery and refreshes them every 60 seconds. They share one device per mount
+("Native Mount: <mount-point name>"), and are normal registry-backed HA
+entities: you can rename them, assign an area, and label them.
 
-### Entity details
+### Entities
 
-| Field | Value |
-|---|---|
-| **Entity ID** | `sensor.native_mount_<first 8 hex chars of UUID>` e.g. `sensor.native_mount_f2f5ddc6` |
-| **Unique ID** | `native_mount_<first 8 hex chars of UUID>` |
-| **State** | `mounted`, `unmounted`, or `unavailable` (add-on not running) |
-| **Attributes** | `uuid`, `mount_point`, `device`, `total_gb`, `used_gb`, `usage_percent` |
-| **Update interval** | Every 60 seconds (first publish as soon as the broker is reachable) |
-| **Icon** | `mdi:harddisk` |
+`<id>` is the first 8 hex characters of the partition UUID, e.g. `f2f5ddc6`.
+
+| Entity ID | Name | State | Unit | Unavailable when |
+|---|---|---|---|---|
+| `sensor.native_mount_<id>` | *(device name)* | `mounted` / `unmounted` | — | the add-on isn't running |
+| `sensor.native_mount_<id>_disk_used` | Disk used | space used | GiB | the add-on isn't running, or the drive is unmounted |
+| `sensor.native_mount_<id>_disk_total` | Disk total | filesystem size | GiB | same as above |
+| `sensor.native_mount_<id>_disk_usage` | Disk usage | used ÷ total | % | same as above |
+
+- The three disk sensors have `state_class: measurement`, so Home Assistant
+  keeps long-term statistics for them: use them in history graphs and
+  statistics cards to watch the drive fill up over time.
+- *Disk used* and *Disk total* have `device_class: data_size`, so you can change
+  the displayed unit (GB, TB, …) per entity in its settings. Values are measured
+  in GiB (binary units, as `df` reports them).
+- The disk sensors go `unavailable` rather than keeping a stale number when the
+  drive is unplugged.
+- Update interval: every 60 seconds, first publish as soon as the broker is
+  reachable.
 
 MQTT topics (all retained), for debugging with *Settings → Devices & services →
 MQTT → Configure → Listen to a topic* (`native_mount/#`):
 
 | Topic | Payload |
 |---|---|
-| `homeassistant/sensor/native_mount_<id>/config` | Discovery config |
-| `native_mount/<id>/state` | `mounted` / `unmounted` |
-| `native_mount/<id>/attributes` | JSON attributes |
+| `homeassistant/sensor/native_mount_<id>[_disk_used\|_disk_total\|_disk_usage]/config` | Discovery configs |
+| `native_mount/<id>/state` | `mounted` / `unmounted` (also the disk sensors' second availability source) |
+| `native_mount/<id>/usage` | `{"used": <GiB>, "total": <GiB>, "percent": <%>}`, published while mounted |
 | `native_mount/status` | `online` / `offline` (availability, shared by all mounts) |
 
 ### Timing semantics (important for automations)
@@ -294,24 +324,48 @@ MQTT → Configure → Listen to a topic* (`native_mount/#`):
 
 ### Alert when storage is getting full
 
-Replace `82` with your preferred threshold:
+Raise a notification above 82% and clear it once usage drops back below 80%.
+The gap keeps it from flapping at the threshold:
 
 ```yaml
 alias: Frigate Drive – Storage High Warning
+mode: single
 triggers:
   - trigger: numeric_state
-    entity_id: sensor.native_mount_f2f5ddc6
-    attribute: usage_percent
+    entity_id: sensor.native_mount_f2f5ddc6_disk_usage
     above: 82
+    id: high
+  - trigger: numeric_state
+    entity_id: sensor.native_mount_f2f5ddc6_disk_usage
+    below: 80
+    id: ok
 actions:
-  - action: persistent_notification.create
-    data:
-      title: Drive Storage Warning
-      message: >
-        Frigate drive usage has reached
-        {{ state_attr('sensor.native_mount_f2f5ddc6', 'usage_percent') }}%
-        — consider freeing space or expanding storage.
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: high
+        sequence:
+          - action: persistent_notification.create
+            data:
+              notification_id: frigate_drive_storage_high
+              title: Frigate drive storage high
+              message: >
+                The Frigate drive is
+                {{ states('sensor.native_mount_f2f5ddc6_disk_usage') }}% full
+                ({{ states('sensor.native_mount_f2f5ddc6_disk_used') | float(0) | round(0) }}
+                of {{ states('sensor.native_mount_f2f5ddc6_disk_total') | float(0) | round(0) }} GiB).
+      - conditions:
+          - condition: trigger
+            id: ok
+        sequence:
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: frigate_drive_storage_high
 ```
+
+A numeric trigger fires again after a restart or an `unavailable` blip if the
+value is still past the threshold. Using a fixed `notification_id` makes that
+harmless: the same notification is updated rather than duplicated.
 
 ---
 
@@ -478,7 +532,7 @@ broker, and the Supervisor exposes its credentials to add-ons through the
 ### How the MQTT pieces fit together
 
 - **Retained messages are the persistence layer.** Discovery config, state,
-  attributes and availability are all published with the retain flag, so the
+  disk usage and availability are all published with the retain flag, so the
   broker always holds the latest values. When HA's MQTT integration (re)connects
   it receives them immediately and rebuilds the entity — no polling, no gap.
 - **The registry entry is owned by HA's MQTT integration**, keyed by
@@ -495,7 +549,7 @@ broker, and the Supervisor exposes its credentials to add-ons through the
   clean shutdown the add-on publishes `offline` itself. `mosquitto_sub`
   reconnects on its own after a broker restart, re-registering the will.
 - **Self-healing.** Every 60-second cycle re-publishes availability, discovery
-  config, state and attributes. If the broker loses its retained store (e.g.
+  configs, disk usage and state. If the broker loses its retained store (e.g.
   persistence disabled) or HA misses a message, everything is back within one
   cycle. HA ignores repeated identical discovery configs, so this is free.
 - **QoS 0 for publishes.** Each publish is a short-lived connection ending in a

@@ -1,10 +1,10 @@
 name: Native Mount
 description: >-
   Mounts external drives (USB, NVMe, etc.) into the host filesystem at boot,
-  before application-stage add-ons start, and publishes a mount-state sensor
-  per drive via MQTT discovery. Useful for pointing Frigate NVR recordings at
+  before application-stage add-ons start, and publishes mount-state and disk-usage sensors
+  for each drive via MQTT discovery. Useful for pointing Frigate NVR recordings at
   an external drive. Requires an MQTT broker (e.g. the Mosquitto broker app).
-version: "4.1.0"
+version: "5.0.0"
 slug: native_mount
 url: https://github.com/kael-shipman/ha-addon-native-mount
 arch:
