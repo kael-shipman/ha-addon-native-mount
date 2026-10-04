@@ -1,8 +1,11 @@
 # Native Mount — Home Assistant Add-on
 
 Mounts one or more external drives (USB, NVMe, etc.) directly into the host
-filesystem at boot and publishes a mount-state entity for each one, so Home
-Assistant automations can start (and stop) anything that depends on the drive.
+filesystem at boot and publishes a mount-state entity for each one (via MQTT
+discovery), so Home Assistant automations can start (and stop) anything that
+depends on the drive.
+
+> **Requires an MQTT broker** — see [Dependencies](#dependencies).
 
 [![Add repository to Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fkael-shipman%2Fha-addon-native-mount)
 
@@ -28,7 +31,7 @@ The add-on does exactly two things:
 
 1. **Mounts** each configured drive at boot.
 2. **Publishes** a `sensor.native_mount_<uuid8>` entity per mount, with state
-   `mounted` or `unmounted`.
+   `mounted` or `unmounted`, through MQTT discovery.
 
 Everything that *depends* on a drive — starting Frigate once its recording disk
 is present, stopping it if the disk disappears, alerting on low space — is an
@@ -77,8 +80,8 @@ mounts:
 ```
 
 **Start Frigate once the drive is mounted** (Frigate set to `boot: manual`).
-At boot the mount entity typically appears 10–60 s before the Supervisor will
-accept start requests, so the start is retried every 30 s for up to ~10 min:
+At boot the mount entity typically appears before the Supervisor will accept
+start requests, so the start is retried every 30 s for up to ~10 min:
 
 ```yaml
 alias: Frigate – Start When Drive Mounted
@@ -147,7 +150,22 @@ actions:
 
 ---
 
+## Dependencies
+
+| Dependency | Why | How to get it |
+|---|---|---|
+| **An MQTT broker** registered with the Supervisor | Entities are published via MQTT discovery; the add-on finds the broker and its credentials through the Supervisor's `mqtt` service | Install the official **Mosquitto broker** app (*Settings → Apps → App store → Mosquitto broker*), start it, and enable *Start on boot* |
+| **The MQTT integration** in Home Assistant, with discovery enabled | Turns the add-on's discovery messages into entities | Installing the Mosquitto app prompts HA to set this up — accept it under *Settings → Devices & services*. Discovery is on by default with the `homeassistant` prefix; this add-on assumes that prefix |
+
+No other add-ons, integrations, or HACS components are needed. Without a broker,
+drives are still **mounted** normally — only the entities are missing — and the
+add-on logs `waiting for MQTT broker...` once a minute until one appears.
+
+---
+
 ## Installing
+
+Install the [dependencies](#dependencies) first, then:
 
 **Option A — one-click:**
 
@@ -187,6 +205,24 @@ mounts:
 | `mounts[].fstype` | No | auto | Filesystem type (`ext4`, `exfat`, `ntfs`, etc.). Omit for auto-detection. |
 | `mounts[].wait_timeout` | No | 30 | Seconds to wait for the device to appear. USB drives may take a few seconds on boot. |
 
+### Upgrading from 3.x
+
+Version 4.0.0 publishes entities via MQTT discovery instead of writing directly
+to Home Assistant's state machine, so it now requires an MQTT broker (see
+[Dependencies](#dependencies)). Entity IDs, state values and attribute names are
+unchanged, so existing automations keep working — **provided the new entity
+gets the same ID**. Because the old 3.x entity lingers in HA's state machine
+until Core restarts, upgrade in this order:
+
+1. Stop the Native Mount add-on (your drives stay mounted).
+2. Restart Home Assistant Core (*Settings → System → Restart*). This clears the
+   old entity.
+3. Update Native Mount to 4.x and start it.
+
+If you skip this and end up with `sensor.native_mount_<uuid8>_2`, restart Core
+(to clear the old entity), then rename the new one back under
+*Settings → Devices & services → Entities*.
+
 ### Upgrading from 2.x
 
 Version 3.0.0 removes `mounts[].on_success`, `mounts[].on_failure` and
@@ -210,33 +246,46 @@ Look for your drive by label, size, or type. The `UUID=` value is what you need.
 
 ## Mount state entities
 
-After mounting, the add-on publishes a `sensor` entity to HA for each configured
-mount and keeps it updated every 15 minutes. No additional add-ons or
-dependencies are required — entity state is written directly to the HA Core state
-machine via the Supervisor API.
+For each configured mount, the add-on publishes a `sensor` entity via MQTT
+discovery and refreshes it every 60 seconds. Each mount also gets its own
+device ("Native Mount: <mount-point name>"), so the entity is a normal,
+registry-backed HA entity: you can rename it, assign it an area, and label it.
 
 ### Entity details
 
 | Field | Value |
 |---|---|
 | **Entity ID** | `sensor.native_mount_<first 8 hex chars of UUID>` e.g. `sensor.native_mount_f2f5ddc6` |
-| **State** | `mounted` or `unmounted` |
+| **Unique ID** | `native_mount_<first 8 hex chars of UUID>` |
+| **State** | `mounted`, `unmounted`, or `unavailable` (add-on not running) |
 | **Attributes** | `uuid`, `mount_point`, `device`, `total_gb`, `used_gb`, `usage_percent` |
-| **Update interval** | Every 15 minutes (first publish as soon as HA Core is ready) |
+| **Update interval** | Every 60 seconds (first publish as soon as the broker is reachable) |
 | **Icon** | `mdi:harddisk` |
+
+MQTT topics (all retained), for debugging with *Settings → Devices & services →
+MQTT → Configure → Listen to a topic* (`native_mount/#`):
+
+| Topic | Payload |
+|---|---|
+| `homeassistant/sensor/native_mount_<id>/config` | Discovery config |
+| `native_mount/<id>/state` | `mounted` / `unmounted` |
+| `native_mount/<id>/attributes` | JSON attributes |
+| `native_mount/status` | `online` / `offline` (availability, shared by all mounts) |
 
 ### Timing semantics (important for automations)
 
-- **First publish:** at boot, the entity appears as soon as HA Core is
-  responding (the add-on polls Core every 15 s). Its first appearance as
-  `mounted` is a state change, so a `to: mounted` trigger fires on every boot.
-- **Not restored across Core restarts:** the entity is written directly to the
-  state machine, not registered by an integration, so it is absent after a
-  Core-only restart until the next 15-minute update. Automations should
-  therefore trigger on the state *change* (as above) rather than assume the
-  entity exists at `homeassistant: start`.
-- **Detection latency:** an unplugged drive is reported as `unmounted` at the
-  next update, i.e. within 15 minutes.
+- **Boot:** drives are mounted first; the entity appears once both the broker
+  and HA's MQTT integration are up. Its first appearance as `mounted` is a
+  state change, so a `to: mounted` trigger fires on every boot.
+- **Core restarts:** the entity reappears with its current state within a
+  second or two of HA's MQTT integration reconnecting (the broker replays the
+  retained messages). That is also a state change, so `to: mounted` triggers
+  fire after a Core-only restart too.
+- **Add-on stopped or crashed:** the entity becomes `unavailable` (graceful
+  shutdown publishes `offline`; a crash triggers the broker-held last will).
+  When the add-on comes back, `unavailable` → `mounted` also fires `to: mounted`.
+- **Detection latency:** an unplugged drive is reported as `unmounted` within
+  60 seconds.
 - **Repeat updates of an unchanged state do not re-fire state triggers.**
 
 ### Alert when storage is getting full
@@ -322,12 +371,12 @@ This add-on requires elevated privileges in order to perform host-level mounts:
 | `privileged: [SYS_ADMIN]` | Required to call `mount(2)` |
 | `privileged: [SYS_PTRACE]` | Required to open `/proc/1/ns/mnt` (a ptrace-protected file) |
 | `full_access: true` | Exposes host block devices (e.g. `/dev/sdb1`) inside the container for device detection |
-| `homeassistant_api: true` | Required to proxy entity state writes to the HA Core REST API |
+| `services: [mqtt:want]` | Lets the add-on read the broker's address and credentials from the Supervisor's `mqtt` service |
 
 These are the minimum permissions needed for the add-on to function. The add-on
-performs no network access beyond the local Supervisor proxy to the Core API,
+talks only to the Supervisor's `mqtt` service endpoint and to the MQTT broker,
 and only reads/writes the mount points you configure. It has no access to the
-Supervisor API for managing other add-ons.
+Home Assistant Core API, nor to the Supervisor API for managing other add-ons.
 
 ---
 
@@ -351,27 +400,28 @@ This should not occur in normal operation (the add-on checks for an existing mou
 before trying). If it does, SSH into the host and run `findmnt <mount_point>` to
 see what is already there.
 
+**Entity missing or `unavailable`**
+
+- Check this add-on's log. `waiting for MQTT broker...` means no broker is
+  registered or reachable — see [Dependencies](#dependencies). A line like
+  `sensor.native_mount_<id>: mounted, …` means publishing works.
+- Confirm the MQTT integration is set up and loaded, and listen to
+  `native_mount/#` (see [Mount state entities](#mount-state-entities)) to see
+  what the broker holds.
+- If the entity exists as `sensor.native_mount_<id>_2`, see
+  [Upgrading from 3.x](#upgrading-from-3x).
+
 **Dependent add-on (e.g. Frigate) not starting after boot**
 
 Check that:
-- The mount entity shows `mounted` (*Developer tools → States*). If it is
-  missing, check this add-on's log for the "HA Core ready" and entity update
-  lines.
+- The mount entity shows `mounted` (*Developer tools → States*). If not, see
+  *Entity missing or `unavailable`* above.
 - Your start automation exists, is enabled, and its trace shows it ran after
   boot.
 - If you use the `switch.<addon>` entity, it is enabled (it is disabled by
   default).
 - The dependent add-on is not in an error state for unrelated reasons (check
   its own logs).
-
-**"Login attempt with invalid authentication" notification**
-
-After entity state updates, HA Core may show a notification about an invalid
-authentication attempt from the add-on's container IP. This is a known audit
-artifact of the Supervisor proxy mechanism — the entity state **is** published
-correctly, and no security breach has occurred. See
-[issue #1](https://github.com/kael-shipman/ha-addon-native-mount/issues/1) for
-context and planned fixes.
 
 ---
 
@@ -383,10 +433,94 @@ context and planned fixes.
   runs. Create it once via `mkdir -p <path>` from a host SSH session.
 - The add-on does not manage other add-ons. Sequencing dependents is done with
   Home Assistant automations driven by the mount entities.
-- Each entity state update generates a "Login attempt with invalid authentication"
-  notification in HA Core. This is a cosmetic audit artifact of the Supervisor's
-  Core API proxy mechanism — entity data is correct and no actual auth failure
-  occurs. See [issue #1](https://github.com/kael-shipman/ha-addon-native-mount/issues/1).
+- Entities require an MQTT broker and HA's MQTT integration (see
+  [Dependencies](#dependencies)). The MQTT discovery prefix is assumed to be the
+  default, `homeassistant`.
+
+---
+
+## Design notes: why MQTT discovery
+
+*Background for maintainers and the curious; nothing here is needed to use the
+add-on.*
+
+### The problem with writing states directly
+
+Versions up to 3.x created entities by `POST`ing to Core's REST API
+(`/api/states/<entity_id>`) through the Supervisor proxy. That call writes a
+value into Core's in-memory **state machine** and nothing else: no integration
+owns the entity, so it has no entity-registry entry, no unique ID, no device,
+and — crucially — it isn't covered by HA's `RestoreEntity` mechanism, which
+only restores state for integration-owned entities. A Core restart therefore
+wiped the entity until the add-on's next push (up to 15 minutes later). It also
+meant the entity couldn't be renamed, labelled or assigned an area in the UI,
+and each proxied write produced a spurious "Login attempt with invalid
+authentication" notification
+([issue #1](https://github.com/kael-shipman/ha-addon-native-mount/issues/1)).
+
+### Options considered
+
+| Option | Survives Core restart | Real (registry) entity | New dependency | Verdict |
+|---|---|---|---|---|
+| Keep REST writes, republish when the entity goes missing | After a short gap (poll interval) | No | None | Treats the symptom; issue #1 remains |
+| **MQTT discovery with retained messages** | **Immediately** | **Yes** | MQTT broker | **Chosen** |
+| Ship a custom integration (via HACS) alongside the add-on | Yes | Yes | A second component to install and version in lock-step | Too heavy for one sensor per drive |
+
+MQTT discovery is Home Assistant's standard way for an external process to
+declare entities. Most installs that run add-ons already have the Mosquitto
+broker, and the Supervisor exposes its credentials to add-ons through the
+`mqtt` service, so no user configuration is needed.
+
+### How the MQTT pieces fit together
+
+- **Retained messages are the persistence layer.** Discovery config, state,
+  attributes and availability are all published with the retain flag, so the
+  broker always holds the latest values. When HA's MQTT integration (re)connects
+  it receives them immediately and rebuilds the entity — no polling, no gap.
+- **The registry entry is owned by HA's MQTT integration**, keyed by
+  `unique_id`. `default_entity_id` asks HA for `sensor.native_mount_<id>`; HA
+  honours it only if that ID is free, otherwise it appends a suffix (hence the
+  [upgrade ordering](#upgrading-from-3x)).
+- **One device per mount** (`name: null` on the entity) keeps the friendly name
+  as "Native Mount: <mount-point name>" and gives each drive its own place in
+  the device list.
+- **Availability via last will.** `mosquitto_pub` is a one-shot client, so it
+  can't carry a last-will message. The add-on therefore keeps one long-lived
+  `mosquitto_sub` connection open purely to hold the will (`native_mount/status`
+  → `offline`, retained). If the container dies, the broker publishes it; on a
+  clean shutdown the add-on publishes `offline` itself. `mosquitto_sub`
+  reconnects on its own after a broker restart, re-registering the will.
+- **Self-healing.** Every 60-second cycle re-publishes availability, discovery
+  config, state and attributes. If the broker loses its retained store (e.g.
+  persistence disabled) or HA misses a message, everything is back within one
+  cycle. HA ignores repeated identical discovery configs, so this is free.
+- **QoS 0 for publishes.** Each publish is a short-lived connection ending in a
+  clean MQTT `DISCONNECT`, so the broker has the message by the time the client
+  exits; QoS 1 would only add a fixed ~1 s acknowledgement wait per message.
+  The last will uses QoS 1.
+- **Orphan cleanup.** The add-on records the mount IDs it published in
+  `/data/published_ids`. On start, any ID no longer in the configuration has
+  its retained topics cleared (empty payloads), which makes HA delete the
+  entity instead of leaving an orphan. The record is only updated once the
+  clearing succeeds.
+
+### Why `mqtt:want` and not `mqtt:need`
+
+The add-on must run at the `initialize` stage so drives are mounted before
+anything else starts — but the Mosquitto broker is a `services`-stage add-on,
+so it isn't running yet at that point. `need` declares a hard dependency that
+the Supervisor may enforce by refusing to start this add-on when no broker is
+registered — which would also block the mounts. `want` declares the same
+access without the hard dependency: the add-on starts, mounts immediately, and
+then waits (retrying every 10 s) for the broker before publishing. Mounting
+never depends on MQTT.
+
+### Why not the Core API at all any more
+
+Dropping the REST writes removes the `homeassistant_api` permission, the
+Core-readiness polling loop, and the spurious authentication notifications.
+The add-on now touches only the Supervisor's `mqtt` service endpoint and the
+broker.
 
 ---
 
