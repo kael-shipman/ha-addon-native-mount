@@ -35,12 +35,15 @@ is present, stopping it if the disk disappears, alerting on low space — is an
 ordinary Home Assistant automation driven by that entity. The add-on itself
 never starts, stops, or otherwise manages other add-ons.
 
-Why not have the add-on start dependents directly? It runs at the `initialize`
-stage, before the Supervisor has finished its own setup, and the Supervisor
-rejects add-on start requests during that window. Home Assistant automations
-only run once the Supervisor and Core are fully up, so the entity-driven
-approach has no such timing hazard — and the dependency stays visible and
-editable in HA instead of buried in add-on options.
+Why not have the add-on start dependents directly? The Supervisor rejects
+add-on start requests ("Supervisor is not ready") until it finishes its own
+boot sequence, which happens *after* every startup stage has run — including
+HA Core and `application`-stage add-ons. This add-on runs at the `initialize`
+stage, so any start command it issued would land inside that window and fail,
+with no good place to retry. An HA automation has the same constraint (Core,
+and therefore the mount entity, also come up before the Supervisor is ready),
+but automations can retry declaratively, report failures in traces, and keep
+the dependency visible and editable in HA instead of buried in add-on options.
 
 ### Recommended setup for a dependent add-on
 
@@ -73,11 +76,14 @@ mounts:
     wait_timeout: 30
 ```
 
-**Start Frigate once the drive is mounted** (Frigate set to `boot: manual`):
+**Start Frigate once the drive is mounted** (Frigate set to `boot: manual`).
+At boot the mount entity typically appears 10–60 s before the Supervisor will
+accept start requests, so the start is retried every 30 s for up to ~10 min:
 
 ```yaml
 alias: Frigate – Start When Drive Mounted
 mode: single
+max_exceeded: silent
 triggers:
   - trigger: homeassistant
     event: start
@@ -92,9 +98,25 @@ conditions:
     entity_id: switch.frigate
     state: "off"
 actions:
-  - action: switch.turn_on
-    target:
-      entity_id: switch.frigate
+  - repeat:
+      sequence:
+        - action: switch.turn_on
+          target:
+            entity_id: switch.frigate
+          continue_on_error: true   # "Supervisor is not ready" during boot
+        - delay: { seconds: 30 }
+        # The Supervisor integration polls slowly; force a fresh read.
+        - action: homeassistant.update_entity
+          target:
+            entity_id: switch.frigate
+        - delay: { seconds: 10 }
+      until:
+        - condition: or
+          conditions:
+            - condition: state
+              entity_id: switch.frigate
+              state: "on"
+            - "{{ repeat.index >= 15 }}"
 ```
 
 **Stop Frigate if the drive goes away** (optional, but prevents Frigate from
@@ -257,6 +279,12 @@ Mounting starts before any later-stage add-on, but the Supervisor only waits for
 this add-on's *container* to start, not for its mounts to finish. That is why
 dependents should be `boot: manual` and started from the entity, as described
 in [The pattern](#the-pattern-mount-entity--dependent-add-on).
+
+Note also that the Supervisor integration's `switch.<addon>` entities poll
+infrequently, and their first snapshot at boot is taken before
+`application`-stage add-ons have started. Anything that reacts to those
+switches right after boot (start retries, health alerts) should force a
+refresh with `homeassistant.update_entity` before trusting an `off` state.
 
 ### Idempotency
 
