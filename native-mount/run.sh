@@ -13,36 +13,6 @@ log_error()   { echo "[$(date '+%H:%M:%S')] [ERROR]   native-mount: $*" >&2; }
 
 trap 'log_info "shutting down"; exit 0' TERM INT
 
-# Thin `ha addons|addon start|stop|restart <slug>` wrapper over the Supervisor API.
-ha() {
-    local cmd="${1:-}" sub="${2:-}" slug="${3:-}"
-    if [ "${cmd}" != "addons" ] && [ "${cmd}" != "addon" ]; then
-        log_error "ha wrapper: only 'addons' commands are supported (got: $*)"; return 1
-    fi
-    case "${sub}" in
-        start|stop|restart)
-            curl -sf -X POST \
-                -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
-                "http://supervisor/addons/${slug}/${sub}" >/dev/null
-            ;;
-        *) log_error "ha wrapper: unsupported subcommand '${sub}'"; return 1 ;;
-    esac
-}
-
-run_commands() {
-    local label="$1" config_path="$2"
-    local count
-    count=$(jq "if ${config_path} then ${config_path} | length else 0 end" "${CONFIG}")
-    [ "${count}" -eq 0 ] && return 0
-    log_info "${label}: running ${count} command(s)"
-    for i in $(seq 0 $((count - 1))); do
-        local cmd
-        cmd=$(jq -r "${config_path}[${i}]" "${CONFIG}")
-        log_info "${label}: $ ${cmd}"
-        if ! eval "${cmd}"; then log_warning "${label}: command exited non-zero: ${cmd}"; fi
-    done
-}
-
 # Push mount state and disk usage to the HA Core state machine.
 # Entity ID: sensor.native_mount_<first 8 hex chars of UUID>
 # No external dependencies — uses the Supervisor API proxy to Core.
@@ -159,7 +129,6 @@ for i in $(seq 0 $((mount_count - 1))); do
     done
 
     if [ "${device_found}" = "false" ]; then
-        run_commands "[${i}] on_failure" ".mounts[${i}].on_failure"
         continue
     fi
 
@@ -167,7 +136,6 @@ for i in $(seq 0 $((mount_count - 1))); do
 
     if nsenter --mount=/proc/1/ns/mnt -- findmnt -n "${mount_point}" >/dev/null 2>&1; then
         log_info "[${i}] ${mount_point} is already mounted — skipping"
-        run_commands "[${i}] on_success" ".mounts[${i}].on_success"
         continue
     fi
 
@@ -181,14 +149,10 @@ for i in $(seq 0 $((mount_count - 1))); do
 
     if [ "${mount_exit}" -eq 0 ]; then
         log_info "[${i}] mounted successfully"
-        run_commands "[${i}] on_success" ".mounts[${i}].on_success"
     else
         log_error "[${i}] mount failed (exit ${mount_exit}): ${mount_out}"
-        run_commands "[${i}] on_failure" ".mounts[${i}].on_failure"
     fi
 done
-
-run_commands "post_mount" ".post_mount_ha_commands"
 
 # ── Entity update loop ─────────────────────────────────────────────────────────
 

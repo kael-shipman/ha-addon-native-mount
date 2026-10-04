@@ -1,8 +1,8 @@
 # Native Mount — Home Assistant Add-on
 
 Mounts one or more external drives (USB, NVMe, etc.) directly into the host
-filesystem at boot — before application-stage add-ons start — and optionally
-runs commands after each mount succeeds or fails.
+filesystem at boot and publishes a mount-state entity for each one, so Home
+Assistant automations can start (and stop) anything that depends on the drive.
 
 [![Add repository to Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fkael-shipman%2Fha-addon-native-mount)
 
@@ -22,21 +22,48 @@ mounts directly inside the host's mount namespace, making them visible system-wi
 
 ---
 
+## The pattern: mount entity → dependent add-on
+
+The add-on does exactly two things:
+
+1. **Mounts** each configured drive at boot.
+2. **Publishes** a `sensor.native_mount_<uuid8>` entity per mount, with state
+   `mounted` or `unmounted`.
+
+Everything that *depends* on a drive — starting Frigate once its recording disk
+is present, stopping it if the disk disappears, alerting on low space — is an
+ordinary Home Assistant automation driven by that entity. The add-on itself
+never starts, stops, or otherwise manages other add-ons.
+
+Why not have the add-on start dependents directly? It runs at the `initialize`
+stage, before the Supervisor has finished its own setup, and the Supervisor
+rejects add-on start requests during that window. Home Assistant automations
+only run once the Supervisor and Core are fully up, so the entity-driven
+approach has no such timing hazard — and the dependency stays visible and
+editable in HA instead of buried in add-on options.
+
+### Recommended setup for a dependent add-on
+
+1. Set the dependent add-on (e.g. Frigate) to **`boot: manual`** (*Settings →
+   Add-ons → Frigate → Start on boot: off*). This guarantees it never starts
+   before its drive is mounted. Do **not** rely on `boot: auto` plus startup
+   stage ordering — the Supervisor does not wait for `initialize`-stage add-ons
+   to finish their work before starting later stages, so a slow-to-appear drive
+   can lose that race.
+2. Add an automation that starts the add-on when the drive is mounted (below).
+3. Optionally, add an automation that stops it if the drive goes away.
+
+---
+
 ## Common use case: Frigate NVR recordings on an external drive
 
 If you run [Frigate](https://github.com/blakeblackshear/frigate) and your internal
 storage fills up with recordings, the natural fix is to point Frigate at an
 external USB or NVMe drive. Frigate reads its recordings from
 `/media/frigate/recordings` (which maps to
-`/mnt/data/supervisor/media/frigate/recordings` on the host). The problem is that
-Home Assistant OS provides no built-in, persistent way to mount an external drive
-there before Frigate starts.
+`/mnt/data/supervisor/media/frigate/recordings` on the host).
 
-Native Mount solves this. Configure it with your drive's UUID and the mount point,
-and it will mount the drive at the `initialize` startup stage — before Frigate
-(which starts at the `application` stage) ever runs.
-
-**Example configuration for Frigate:**
+**Add-on configuration:**
 
 ```yaml
 mounts:
@@ -44,22 +71,57 @@ mounts:
     mount_point: /mnt/data/supervisor/media/frigate
     fstype: ext4
     wait_timeout: 30
-    on_success:
-      - ha addons start ccab4aaf_frigate
-post_mount_ha_commands: []
 ```
 
-With this config, on every boot Native Mount will:
-1. Wait up to 30 seconds for the drive to appear
-2. Mount it at `/mnt/data/supervisor/media/frigate` in the host namespace
-3. Start Frigate
+**Start Frigate once the drive is mounted** (Frigate set to `boot: manual`):
+
+```yaml
+alias: Frigate – Start When Drive Mounted
+mode: single
+triggers:
+  - trigger: homeassistant
+    event: start
+  - trigger: state
+    entity_id: sensor.native_mount_f2f5ddc6
+    to: mounted
+conditions:
+  - condition: state
+    entity_id: sensor.native_mount_f2f5ddc6
+    state: mounted
+  - condition: state
+    entity_id: switch.frigate
+    state: "off"
+actions:
+  - action: switch.turn_on
+    target:
+      entity_id: switch.frigate
+```
+
+**Stop Frigate if the drive goes away** (optional, but prevents Frigate from
+silently writing recordings to the empty mount-point directory on your internal
+disk):
+
+```yaml
+alias: Frigate – Stop When Drive Unmounted
+mode: single
+triggers:
+  - trigger: state
+    entity_id: sensor.native_mount_f2f5ddc6
+    to: unmounted
+actions:
+  - action: switch.turn_off
+    target:
+      entity_id: switch.frigate
+```
+
+> **`switch.frigate`** is the Supervisor integration's per-add-on switch. It is
+> **disabled by default** — enable it under *Settings → Devices & services →
+> Supervisor → Frigate → entities*. Alternatively use the
+> `hassio.addon_start` / `hassio.addon_stop` actions with
+> `addon: ccab4aaf_frigate` (the slug is visible in the add-on store URL).
 
 > **Tip:** Find your drive's UUID by SSH-ing into HA (`ssh -p 22222 root@<ha-ip>`)
 > and running `blkid`. Look for your drive's label or size to identify it.
-
-> **Frigate add-on slug:** The slug in `ha addons start <slug>` is visible in the
-> add-on store URL or in the Supervisor logs. For the community Frigate add-on it
-> is typically `ccab4aaf_frigate`.
 
 ---
 
@@ -91,43 +153,26 @@ mounts:
     mount_point: /mnt/data/supervisor/media/frigate
     fstype: ext4          # optional — omit for auto-detect
     wait_timeout: 30      # optional — seconds to wait for the device, default 30
-    on_success:           # optional — commands to run if mount succeeds
-      - ha addons start ccab4aaf_frigate
-    on_failure:           # optional — commands to run if mount fails or times out
-      - ha addons stop ccab4aaf_frigate
-post_mount_ha_commands:   # optional — commands to run after all mounts complete
-  - ha addons restart core_mosquitto
 ```
 
 ### Option details
 
 | Option | Required | Default | Description |
 |---|---|---|---|
-| `mounts` | Yes | `[]` | List of drives to mount. |
+| `mounts` | Yes | `[]` | List of drives to mount. Each produces one entity. |
 | `mounts[].device_uuid` | Yes | — | Filesystem UUID of the partition (`blkid` output). |
 | `mounts[].mount_point` | Yes | — | Absolute host path to mount onto. Must exist before the add-on runs — create it once from a host SSH session. |
 | `mounts[].fstype` | No | auto | Filesystem type (`ext4`, `exfat`, `ntfs`, etc.). Omit for auto-detection. |
 | `mounts[].wait_timeout` | No | 30 | Seconds to wait for the device to appear. USB drives may take a few seconds on boot. |
-| `mounts[].on_success` | No | `[]` | Shell commands to run if the mount succeeds (or was already mounted). Executed in order; a non-zero exit is logged as a warning and does not stop subsequent commands. |
-| `mounts[].on_failure` | No | `[]` | Shell commands to run if the device is not found or the mount fails. |
-| `post_mount_ha_commands` | No | `[]` | Commands to run after all mounts complete, regardless of individual mount outcomes. |
 
-### Available commands
+### Upgrading from 2.x
 
-Commands run inside the add-on container. A thin `ha` wrapper is provided that
-translates `ha addons start|stop|restart <slug>` into Supervisor API calls, so
-you can use the same syntax you would from a host SSH session.
-
-**Examples:**
-```
-ha addons start ccab4aaf_frigate
-ha addons stop ccab4aaf_frigate
-ha addons restart core_mosquitto
-```
-
-No other host-level commands are available from inside the container. If you need
-to run arbitrary host commands, do so from a host SSH session or a separate
-automation.
+Version 3.0.0 removes `mounts[].on_success`, `mounts[].on_failure` and
+`post_mount_ha_commands`, along with the in-container `ha addons` wrapper they
+relied on. Delete those keys from your add-on configuration and replace any
+`ha addons start|stop` commands with automations as shown in
+[The pattern](#the-pattern-mount-entity--dependent-add-on). The add-on also no
+longer requests Supervisor `manager` API access.
 
 ### Finding your partition UUID
 
@@ -141,10 +186,64 @@ Look for your drive by label, size, or type. The `UUID=` value is what you need.
 
 ---
 
+## Mount state entities
+
+After mounting, the add-on publishes a `sensor` entity to HA for each configured
+mount and keeps it updated every 15 minutes. No additional add-ons or
+dependencies are required — entity state is written directly to the HA Core state
+machine via the Supervisor API.
+
+### Entity details
+
+| Field | Value |
+|---|---|
+| **Entity ID** | `sensor.native_mount_<first 8 hex chars of UUID>` e.g. `sensor.native_mount_f2f5ddc6` |
+| **State** | `mounted` or `unmounted` |
+| **Attributes** | `uuid`, `mount_point`, `device`, `total_gb`, `used_gb`, `usage_percent` |
+| **Update interval** | Every 15 minutes (first publish as soon as HA Core is ready) |
+| **Icon** | `mdi:harddisk` |
+
+### Timing semantics (important for automations)
+
+- **First publish:** at boot, the entity appears as soon as HA Core is
+  responding (the add-on polls Core every 15 s). Its first appearance as
+  `mounted` is a state change, so a `to: mounted` trigger fires on every boot.
+- **Not restored across Core restarts:** the entity is written directly to the
+  state machine, not registered by an integration, so it is absent after a
+  Core-only restart until the next 15-minute update. Automations should
+  therefore trigger on the state *change* (as above) rather than assume the
+  entity exists at `homeassistant: start`.
+- **Detection latency:** an unplugged drive is reported as `unmounted` at the
+  next update, i.e. within 15 minutes.
+- **Repeat updates of an unchanged state do not re-fire state triggers.**
+
+### Alert when storage is getting full
+
+Replace `82` with your preferred threshold:
+
+```yaml
+alias: Frigate Drive – Storage High Warning
+triggers:
+  - trigger: numeric_state
+    entity_id: sensor.native_mount_f2f5ddc6
+    attribute: usage_percent
+    above: 82
+actions:
+  - action: persistent_notification.create
+    data:
+      title: Drive Storage Warning
+      message: >
+        Frigate drive usage has reached
+        {{ state_attr('sensor.native_mount_f2f5ddc6', 'usage_percent') }}%
+        — consider freeing space or expanding storage.
+```
+
+---
+
 ## Startup ordering
 
-This add-on runs at the `initialize` startup stage. Home Assistant add-ons run in
-this order:
+This add-on runs at the `initialize` startup stage, the earliest one available
+to add-ons:
 
 | Stage | Examples |
 |---|---|
@@ -154,18 +253,16 @@ this order:
 | `application` | Frigate, Node-RED, custom add-ons |
 | `once` | One-shot scripts |
 
-This means the drive will be mounted before Frigate (or any other `application`-
-stage add-on) starts. If you set Frigate to `boot: auto`, it will already find
-the drive mounted when it comes up — no `on_success` command needed. Use
-`on_success` only if you want strict sequencing (e.g. you've set Frigate to
-`boot: manual` and want this add-on to start it explicitly).
+Mounting starts before any later-stage add-on, but the Supervisor only waits for
+this add-on's *container* to start, not for its mounts to finish. That is why
+dependents should be `boot: manual` and started from the entity, as described
+in [The pattern](#the-pattern-mount-entity--dependent-add-on).
 
 ### Idempotency
 
 The add-on is safe to run multiple times. If the mount point is already occupied
 when the add-on runs (which can happen because the HA Supervisor runs
-`initialize`-stage add-ons more than once during boot), the mount is skipped and
-`on_success` commands are still executed.
+`initialize`-stage add-ons more than once during boot), the mount is skipped.
 
 ---
 
@@ -197,88 +294,12 @@ This add-on requires elevated privileges in order to perform host-level mounts:
 | `privileged: [SYS_ADMIN]` | Required to call `mount(2)` |
 | `privileged: [SYS_PTRACE]` | Required to open `/proc/1/ns/mnt` (a ptrace-protected file) |
 | `full_access: true` | Exposes host block devices (e.g. `/dev/sdb1`) inside the container for device detection |
-| `hassio_api: true` + `hassio_role: manager` | Required to call the Supervisor API for `ha addons start/stop` |
 | `homeassistant_api: true` | Required to proxy entity state writes to the HA Core REST API |
 
 These are the minimum permissions needed for the add-on to function. The add-on
-performs no network access beyond the local Supervisor and Core APIs, and only
-reads/writes the mount points you configure.
-
----
-
-## Mount state entities
-
-After mounting, the add-on publishes a `sensor` entity to HA for each configured
-mount and keeps it updated every 15 minutes. No additional add-ons or
-dependencies are required — entity state is written directly to the HA Core state
-machine via the Supervisor API.
-
-### Entity details
-
-| Field | Value |
-|---|---|
-| **Entity ID** | `sensor.native_mount_<first 8 hex chars of UUID>` e.g. `sensor.native_mount_f2f5ddc6` |
-| **State** | `mounted` or `unmounted` |
-| **Attributes** | `uuid`, `mount_point`, `device`, `total_gb`, `used_gb`, `usage_percent` |
-| **Update interval** | Every 15 minutes (immediately on startup) |
-| **Icon** | `mdi:harddisk` |
-
-### Using entities in automations
-
-**Start Frigate only when the drive is confirmed mounted:**
-
-```yaml
-automation:
-  - alias: Start Frigate when drive is mounted
-    trigger:
-      - platform: state
-        entity_id: sensor.native_mount_f2f5ddc6
-        to: mounted
-    action:
-      - service: hassio.addon_start
-        data:
-          addon: ccab4aaf_frigate
-```
-
-**Alert when a drive goes missing:**
-
-```yaml
-automation:
-  - alias: Alert when Frigate drive is unmounted
-    trigger:
-      - platform: state
-        entity_id: sensor.native_mount_f2f5ddc6
-        to: unmounted
-    action:
-      - service: notify.mobile_app
-        data:
-          message: "Frigate external drive is not mounted!"
-```
-
-**Notify when storage is getting full (replace `82` with your preferred threshold):**
-
-```yaml
-automation:
-  - alias: Notify when Frigate drive storage is high
-    trigger:
-      - platform: numeric_state
-        entity_id: sensor.native_mount_f2f5ddc6
-        attribute: usage_percent
-        above: 82
-    action:
-      - service: persistent_notification.create
-        data:
-          title: "Drive Storage Warning"
-          message: >
-            Frigate drive usage has reached
-            {{ state_attr('sensor.native_mount_f2f5ddc6', 'usage_percent') }}%
-            — consider freeing space or expanding storage.
-```
-
-> **Note:** There is no native mechanism in Home Assistant to declare add-on
-> dependencies. The entity reporting feature in this add-on has no external
-> dependencies — it talks directly to the HA Core API. No MQTT broker or any other
-> add-on is required.
+performs no network access beyond the local Supervisor proxy to the Core API,
+and only reads/writes the mount points you configure. It has no access to the
+Supervisor API for managing other add-ons.
 
 ---
 
@@ -302,14 +323,18 @@ This should not occur in normal operation (the add-on checks for an existing mou
 before trying). If it does, SSH into the host and run `findmnt <mount_point>` to
 see what is already there.
 
-**Frigate not starting**
+**Dependent add-on (e.g. Frigate) not starting after boot**
 
 Check that:
-- The `on_success` command uses the correct add-on slug (visible in the store URL
-  or Supervisor logs).
-- Frigate itself is not in an error state for unrelated reasons (check its own
-  logs).
-- The mount point directory exists on the host at the path you configured.
+- The mount entity shows `mounted` (*Developer tools → States*). If it is
+  missing, check this add-on's log for the "HA Core ready" and entity update
+  lines.
+- Your start automation exists, is enabled, and its trace shows it ran after
+  boot.
+- If you use the `switch.<addon>` entity, it is enabled (it is disabled by
+  default).
+- The dependent add-on is not in an error state for unrelated reasons (check
+  its own logs).
 
 **"Login attempt with invalid authentication" notification**
 
@@ -328,13 +353,8 @@ context and planned fixes.
   boot, which is the intended behavior.
 - The `mount_point` directory must already exist on the host before the add-on
   runs. Create it once via `mkdir -p <path>` from a host SSH session.
-- Commands in `on_success`, `on_failure`, and `post_mount_ha_commands` run inside
-  the add-on container. Only `ha addons start|stop|restart <slug>` is supported;
-  arbitrary host shell commands will not work.
-- There is no native HA mechanism to declare add-on dependencies, so if a command
-  references another add-on (e.g. Mosquitto for a future MQTT feature), that
-  add-on must be installed separately. The add-on will log a clear error if a
-  required add-on is not available.
+- The add-on does not manage other add-ons. Sequencing dependents is done with
+  Home Assistant automations driven by the mount entities.
 - Each entity state update generates a "Login attempt with invalid authentication"
   notification in HA Core. This is a cosmetic audit artifact of the Supervisor's
   Core API proxy mechanism — entity data is correct and no actual auth failure
