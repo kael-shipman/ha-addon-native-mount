@@ -227,6 +227,10 @@ The old `_gb` attributes were actually GiB; the new sensors say so. `uuid`,
 `mount_point` and `device` have no replacement. They're in the add-on's
 configuration and log.
 
+After updating, Home Assistant keeps showing the last attribute values until the
+MQTT integration reloads. Reload it (*Settings → Devices & services → MQTT → ⋮ →
+Reload*) or restart Core to clear them.
+
 ### Upgrading from 3.x
 
 Version 4.0.0 publishes entities via MQTT discovery instead of writing directly
